@@ -15,7 +15,9 @@ from ..pricing import (
     cheapest_quantity_plan,
     collect_offers,
     distance_travelled,
+    drive_distance_km,
     family_products,
+    fuel_cost_cents,
     maximise_caffeine,
 )
 from ..schemas import (
@@ -29,7 +31,7 @@ from ..schemas import (
     RoutePlanOut,
     RouteStopOut,
 )
-from ..scrape.fuelwatch import price_for_suburb
+from ..scrape.fuelwatch import ulp_prices
 from .deps import clamp_radius, default_since, format_cents, nearby_stores, utcnow
 
 router = APIRouter(prefix="/v1", tags=["plans"])
@@ -69,6 +71,32 @@ def _label_for(family, offers, store_id):
     return None, None
 
 
+def _fuel_quote(
+    travel_km: float,
+    suburbs: list[str | None],
+    prices: dict[str, int],
+) -> tuple[int | None, int, str | None]:
+    """Fuel price, cost and source for one plan.
+
+    The single model both plan endpoints use: cheapest ULP among the suburbs the
+    plan touches (FuelWatch publishes per suburb), falling back to
+    FUEL_PRICE_CENTS_PER_L when the feed is off or has no row. Passing the price
+    map in keeps basket compare to one feed read per request, however many stores
+    it prices.
+    """
+    fuel_cents_per_l: int | None = None
+    for suburb in suburbs:
+        if not suburb:
+            continue
+        price = prices.get(suburb.strip().upper())
+        if price:
+            fuel_cents_per_l = price if fuel_cents_per_l is None else min(fuel_cents_per_l, price)
+    if fuel_cents_per_l is None:
+        fuel_cents_per_l = settings.fuel_price_cents_per_l
+        return fuel_cents_per_l, fuel_cost_cents(travel_km, fuel_cents_per_l), "fallback"
+    return fuel_cents_per_l, fuel_cost_cents(travel_km, fuel_cents_per_l), "fuelwatch"
+
+
 @router.post(
     "/basket/compare",
     response_model=BasketCompareOut,
@@ -83,6 +111,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
     families = _resolve_families(session, payload.items)
     per_store, offers = _bundles_by_store(session, stores, families, since, distances)
 
+    prices = ulp_prices() if stores else {}
     store_results: list[BasketStoreOut] = []
     for store in stores:
         available = per_store.get(store.id, {})
@@ -117,24 +146,39 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
                 )
             )
             total += cost
+        # A single-store plan is a there-and-back trip, and the road is longer
+        # than the straight line, so charge fuel on the driven round trip —
+        # otherwise the shop-with-no-detour always wins.
+        straight_km = distances.get(store.id, 0.0)
+        drive_km = round(drive_distance_km(2 * straight_km), 1)
+        _, fuel_cost, _ = _fuel_quote(drive_km, [store.suburb], prices)
         store_results.append(
             BasketStoreOut(
                 store_id=store.id,
                 store_name=store.name,
                 chain_code=store.chain.code,
                 suburb=store.suburb,
-                distance_km=distances.get(store.id, 0.0),
+                distance_km=straight_km,
+                drive_distance_km=drive_km,
+                fuel_cost_cents=fuel_cost,
                 total_cents=total,
+                total_with_fuel_cents=total + fuel_cost,
                 total=format_cents(total),
+                total_with_fuel=format_cents(total + fuel_cost),
                 complete=complete,
                 items=lines,
             )
         )
 
-    store_results.sort(key=lambda row: (not row.complete, row.total_cents))
+    def rank_cents(row: BasketStoreOut) -> int:
+        # Fuel is part of the recommendation unless the caller opts out.
+        return row.total_with_fuel_cents if payload.include_fuel else row.total_cents
 
+    store_results.sort(key=lambda row: (not row.complete, rank_cents(row)))
+
+    by_id = {store.id: store for store in stores}
     multi_plan: list[dict] = []
-    multi_total = 0
+    multi_items = 0
     for slug, quantity, family in families:
         best: tuple[int, int, str, str] | None = None
         for store in stores:
@@ -146,7 +190,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
             if best is None or cost < best[0]:
                 best = (cost, store.id, store.name, store.chain.code)
         if best is not None:
-            multi_total += best[0]
+            multi_items += best[0]
             multi_plan.append(
                 {
                     "requested": slug,
@@ -154,21 +198,51 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
                     "store_id": best[1],
                     "store_name": best[2],
                     "chain_code": best[3],
+                    "distance_km": distances.get(best[1], 0.0),
                     "cost_cents": best[0],
                     "cost": format_cents(best[0]),
                 }
             )
 
-    complete_prices = [row.total_cents for row in store_results if row.complete]
+    # Price the detour with the same model /v1/plan/route uses: nearest-neighbour
+    # tour over the chosen stops, scaled to road distance, fuelled at the cheapest
+    # ULP among their suburbs. Without this a three-stop plan was compared on
+    # shelf prices alone, so it always looked cheapest.
+    stop_ids = {entry["store_id"] for entry in multi_plan}
+    stop_points = [
+        (by_id[store_id].lat, by_id[store_id].lon)
+        for store_id in stop_ids
+        if by_id[store_id].lat is not None and by_id[store_id].lon is not None
+    ]
+    multi_straight_km = (
+        round(distance_travelled(stop_points, (payload.lat, payload.lon)), 1) if stop_points else 0.0
+    )
+    multi_travel_km = round(drive_distance_km(multi_straight_km), 1)
+    fuel_cents_per_l, multi_fuel_cost, fuel_source = _fuel_quote(
+        multi_travel_km,
+        [by_id[store_id].suburb for store_id in stop_ids],
+        prices,
+    )
+    multi_total = multi_items + multi_fuel_cost if payload.include_fuel else multi_items
+
+    ranked_cents = [rank_cents(row) for row in store_results if row.complete]
     return BasketCompareOut(
         generated_at=utcnow(),
         radius_km=radius,
         stores=store_results[:25],
         best_single_store=store_results[0] if store_results and store_results[0].complete else None,
-        multi_store_total_cents=multi_total or None,
+        include_fuel=payload.include_fuel,
+        drive_factor=settings.drive_factor,
+        fuel_price_cents_per_l=fuel_cents_per_l if multi_plan else None,
+        fuel_source=fuel_source if multi_plan else None,
+        multi_store_items_cents=multi_items if multi_plan else None,
+        multi_store_straight_line_km=multi_straight_km if multi_plan else None,
+        multi_store_travel_km=multi_travel_km if multi_plan else None,
+        multi_store_fuel_cost_cents=multi_fuel_cost if multi_plan else None,
+        multi_store_total_cents=multi_total if multi_plan else None,
         multi_store_plan=multi_plan,
-        savings_vs_worst_cents=(max(complete_prices) - min(complete_prices))
-        if len(complete_prices) > 1
+        savings_vs_worst_cents=(max(ranked_cents) - min(ranked_cents))
+        if len(ranked_cents) > 1
         else None,
     )
 
@@ -375,23 +449,17 @@ def route_plan(
             )
         )
 
-    travel_km = round(distance_travelled(points, (lat, lon)), 1) if points else 0.0
+    straight_line_km = round(distance_travelled(points, (lat, lon)), 1) if points else 0.0
+    travel_km = round(drive_distance_km(straight_line_km), 1)
     fuel_cents_per_l: int | None = None
+    fuel_cost = 0
     fuel_source: str | None = None
-    for stop in stop_rows:
-        price = price_for_suburb(stop.suburb)
-        if price:
-            fuel_cents_per_l = price if fuel_cents_per_l is None else min(fuel_cents_per_l, price)
-    if fuel_cents_per_l is None and settings.fuelwatch_enabled:
-        fuel_cents_per_l = settings.fuel_price_cents_per_l
-        fuel_source = "fallback"
-    if fuel_cents_per_l:
-        fuel_source = fuel_source or "fuelwatch"
-    fuel_cost = (
-        round(travel_km * settings.vehicle_l_per_100km / 100 * fuel_cents_per_l)
-        if fuel_cents_per_l
-        else 0
-    )
+    if stop_rows:
+        fuel_cents_per_l, fuel_cost, fuel_source = _fuel_quote(
+            travel_km,
+            [stop.suburb for stop in stop_rows],
+            ulp_prices(),
+        )
     items_total = sum(row.subtotal_cents for row in stop_rows)
 
     baseline: int | None = None
@@ -416,7 +484,9 @@ def route_plan(
         origin={"lat": lat, "lon": lon},
         stops=stop_rows,
         items_total_cents=items_total,
+        straight_line_km=straight_line_km,
         travel_km=travel_km,
+        drive_factor=settings.drive_factor,
         fuel_price_cents_per_l=fuel_cents_per_l,
         fuel_cost_cents=fuel_cost,
         total_cost_cents=total_cost,

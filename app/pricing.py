@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .api.deps import bulk_latest_prices
+from .config import settings
 from .models import Product, Store
 
 
@@ -302,7 +303,11 @@ def maximise_caffeine(items: list[KnapsackItem], budget_cents: int) -> KnapsackR
 
 
 def distance_travelled(points: list[tuple[float, float]], origin: tuple[float, float]) -> float:
-    """Simple nearest-neighbour tour length in km, starting and ending at origin."""
+    """Straight-line nearest-neighbour tour length in km, starting and ending at origin.
+
+    This is crow flight only; cost a plan with drive_distance_km() instead, and
+    keep this value if you need to show what the geometry alone said.
+    """
     from .api.deps import haversine_km
 
     remaining = list(points)
@@ -316,3 +321,23 @@ def distance_travelled(points: list[tuple[float, float]], origin: tuple[float, f
     if points:
         total += haversine_km(current[0], current[1], origin[0], origin[1])
     return total
+
+
+def drive_distance_km(straight_km: float, drive_factor: float | None = None) -> float:
+    """How far the car actually travels for a straight-line distance.
+
+    Haversine draws a line across the Swan and through Perth's street grid; the
+    driven route is ~30% longer. Without this factor a multi-store trip looks
+    cheaper than the detour really is. Factors below 1 are ignored: a road can
+    never beat the straight line it replaces.
+    """
+    factor = settings.drive_factor if drive_factor is None else drive_factor
+    return straight_km * max(1.0, factor)
+
+
+def fuel_cost_cents(travel_km: float, fuel_price_cents_per_l: int | None) -> int:
+    """Fuel for a driven tour at the configured consumption, in whole cents."""
+    if not fuel_price_cents_per_l:
+        return 0
+    return round(travel_km * settings.vehicle_l_per_100km / 100 * fuel_price_cents_per_l)
+
