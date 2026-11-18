@@ -18,7 +18,7 @@ scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
   sources write into.
 * Accepts **crowd sightings** from the app: price, photo of the tag, scanned
   barcode, and (for unknown cans) the name off the label.
-* Serves small, cached JSON for the phone widget.
+* Serves small JSON for the phone widget.
 * Answers the questions that need maths: *which store is cheapest for this list*,
   *what is the best use of $20 if I only care about caffeine*, *is the drive worth
   it once fuel is counted*.
