@@ -86,6 +86,9 @@ def install_page() -> HTMLResponse:
   <li>Open the file, allow <em>Install unknown apps</em> for your browser, then install.</li>
   <li>Open DrinkWatch, allow location, and the Prices tab fills in within a few seconds.</li>
 </ol>
+<p class="muted">After the first install the app updates itself: it checks
+<code>/app/version.json</code> on launch, offers the new build in a dialog and hands
+the downloaded APK to the system installer. Settings also has a manual check.</p>
 <p class="muted">The app stores one anonymous device token (encrypted, on the phone) so crowd
 submissions can be attributed and moderated. Photos are stripped of EXIF/GPS on upload.
 Store locations come from OpenStreetMap; fuel prices from FuelWatch WA. Supermarket prices
