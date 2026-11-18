@@ -3,13 +3,31 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
 
 from ..models import Observation, Product, Store
+
+# Reputation only matters if it changes an outcome. A confirm from a device at
+# TRUSTED_REPUTATION is worth two ordinary ones, and a device at
+# EXEMPT_REPUTATION has a long enough accepted history that its own sightings
+# skip the review queue: its track record is the review.
+TRUSTED_REPUTATION = 20
+TRUSTED_CONFIRM_WEIGHT = 2
+EXEMPT_REPUTATION = 50
+# Three independent "that's wrong" votes pull a row out of the headline price,
+# the same count vote() uses to demote a row back to needs_review.
+DISPUTE_LIMIT = 3
+
+
+def confirm_weight(reputation: int | None) -> int:
+    """What one confirm from a device with this reputation is worth."""
+    return TRUSTED_CONFIRM_WEIGHT if (reputation or 0) >= TRUSTED_REPUTATION else 1
 
 
 def utcnow() -> datetime:
@@ -65,13 +83,27 @@ _STORE_SCOPE_SQL = text(
     select distinct on (o.store_id)
            o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.observed_at,
+           coalesce(votes.confirm_weight, 0) as confirm_weight,
+           coalesce(author.reputation, 0) as device_reputation
     from observations o
+    left join lateral (
+        select sum(case when v.vote > 0
+                        then case when d.reputation >= :trusted_reputation
+                                  then :trusted_confirm_weight else 1 end
+                        else 0 end) as confirm_weight,
+               sum(case when v.vote < 0 then 1 else 0 end) as dispute_weight
+          from observation_votes v
+          join devices d on d.id = v.device_id
+         where v.observation_id = o.id
+    ) votes on true
+    left join devices author on author.id = o.device_id
     where o.store_id in :store_ids
       and o.product_id in :product_ids
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.store_id, o.observed_at desc, o.id desc
+      and coalesce(votes.dispute_weight, 0) < :dispute_limit
+    order by o.store_id, o.observed_at desc, confirm_weight desc, device_reputation desc, o.id desc
     """
 ).bindparams(bindparam("store_ids", expanding=True), bindparam("product_ids", expanding=True))
 
@@ -80,16 +112,38 @@ _CHAIN_SCOPE_SQL = text(
     select distinct on (o.chain_id)
            o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.observed_at,
+           coalesce(votes.confirm_weight, 0) as confirm_weight,
+           coalesce(author.reputation, 0) as device_reputation
     from observations o
+    left join lateral (
+        select sum(case when v.vote > 0
+                        then case when d.reputation >= :trusted_reputation
+                                  then :trusted_confirm_weight else 1 end
+                        else 0 end) as confirm_weight,
+               sum(case when v.vote < 0 then 1 else 0 end) as dispute_weight
+          from observation_votes v
+          join devices d on d.id = v.device_id
+         where v.observation_id = o.id
+    ) votes on true
+    left join devices author on author.id = o.device_id
     where o.chain_id in :chain_ids
       and o.product_id in :product_ids
       and o.store_id is null
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.chain_id, o.observed_at desc, o.id desc
+      and coalesce(votes.dispute_weight, 0) < :dispute_limit
+    order by o.chain_id, o.observed_at desc, confirm_weight desc, device_reputation desc, o.id desc
     """
 ).bindparams(bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True))
+
+# Passed alongside the expanding id lists. Kept in one dict so the SQL, vote()
+# and the review gate cannot drift apart on what "trusted" means.
+_VOTE_SUPPORT_PARAMS = {
+    "trusted_reputation": TRUSTED_REPUTATION,
+    "trusted_confirm_weight": TRUSTED_CONFIRM_WEIGHT,
+    "dispute_limit": DISPUTE_LIMIT,
+}
 
 
 _BULK_STORE_SQL = text(
@@ -166,16 +220,132 @@ def bulk_latest_prices(
     return found
 
 
+@dataclass(frozen=True)
+class StorePrice:
+    """The freshest row for one store, plus the row it beat.
+
+    `primary` is what the store is showing now; `fallback` is the other scope's
+    row, kept because it is still evidence — usually the only first-hand
+    sighting for that shelf — and dropping it here would force a caller that
+    wants the other view to query the ledger again.
+    """
+
+    primary: Observation
+    fallback: Observation | None = None
+
+
+@dataclass(frozen=True)
+class VoteSupport:
+    """What the crowd said about one row, as far as ranking cares.
+
+    `confirm_weight` sums each confirm at the voter's weight (see
+    confirm_weight()), so one trusted confirm and two ordinary ones compare
+    equal; `device_reputation` is the submitting device's standing.
+    """
+
+    confirm_weight: int = 0
+    device_reputation: int = 0
+
+
+def _candidate(row: dict[str, Any]) -> tuple[Observation, VoteSupport]:
+    """Split one query row into the observation and its vote support.
+
+    The vote columns are decorations from the join, not Observation attributes,
+    so they must be removed before the ORM constructor sees the row.
+    """
+    data = dict(row)
+    support = VoteSupport(
+        confirm_weight=int(data.pop("confirm_weight", 0) or 0),
+        device_reputation=int(data.pop("device_reputation", 0) or 0),
+    )
+    return Observation(**data), support
+
+
+def _as_utc(moment: datetime) -> datetime:
+    # Compare in one timezone: a naive timestamp (age_hours() tolerates those
+    # as well) must not raise TypeError halfway through a request.
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _chain_attributed(row: Observation, store_id: int) -> Observation:
+    """Copy a chain-wide row (store_id NULL) so it can stand for one store."""
+    return Observation(
+        id=row.id,
+        store_id=store_id,
+        chain_id=row.chain_id,
+        product_id=row.product_id,
+        price_cents=row.price_cents,
+        was_price_cents=row.was_price_cents,
+        unit_price_cents_per_l=row.unit_price_cents_per_l,
+        promo_kind=row.promo_kind,
+        promo_qty=row.promo_qty,
+        promo_total_cents=row.promo_total_cents,
+        in_stock=row.in_stock,
+        source=row.source,
+        price_scope="chain",
+        observed_at=row.observed_at,
+    )
+
+
+def _freshest(
+    store_row: Observation | None,
+    chain_row: Observation | None,
+    store_id: int,
+    support: dict[int, VoteSupport] | None = None,
+) -> StorePrice | None:
+    """Pick whichever of the two candidate rows was observed more recently.
+
+    Freshest wins rather than "store scope wins" because age is what makes a
+    price wrong: a crowd report from 71 hours ago silently shadowing last
+    night's scrape is how a stale $3.15 ends up the headline "cheapest" beside
+    a real $3.50.
+
+    An exact tie is settled by the crowd before scope is considered: more
+    weighted confirms wins, then the more reputable author, and only then does
+    the row seen on that shelf beat the chain-wide proxy. Without this the
+    same-second candidates were decided by which table they came from, which
+    meant votes never changed anything.
+    """
+    if chain_row is None:
+        return StorePrice(primary=store_row) if store_row is not None else None
+    chain_offer = _chain_attributed(chain_row, store_id)
+    if store_row is None:
+        return StorePrice(primary=chain_offer)
+    store_at, chain_at = _as_utc(store_row.observed_at), _as_utc(chain_row.observed_at)
+    if chain_at > store_at:
+        return StorePrice(primary=chain_offer, fallback=store_row)
+    if store_at > chain_at:
+        return StorePrice(primary=store_row, fallback=chain_offer)
+
+    support = support or {}
+    store_votes = support.get(store_row.id, VoteSupport())
+    chain_votes = support.get(chain_row.id, VoteSupport())
+    if (chain_votes.confirm_weight, chain_votes.device_reputation) > (
+        store_votes.confirm_weight,
+        store_votes.device_reputation,
+    ):
+        return StorePrice(primary=chain_offer, fallback=store_row)
+    return StorePrice(primary=store_row, fallback=chain_offer)
+
+
 def latest_prices(
     session: Session,
     stores: list[Store],
     product_ids: list[int] | int,
     since: datetime,
-) -> dict[int, Observation]:
-    """Newest accepted price per store.
+) -> dict[int, StorePrice]:
+    """Freshest accepted price per store, whichever scope it came from.
 
-    Store-specific sightings (SpudShed, crowd) win; otherwise the chain-wide
-    online price is attributed to every store in that chain.
+    Both candidates are always fetched: the store's own sightings and the
+    chain-wide online price attributed to every store in that chain. Whichever
+    was observed most recently becomes the offer, so a stale store row can no
+    longer shadow last night's scrape; the losing row is kept as a fallback.
+
+    Votes reach this query too. Rows at DISPUTE_LIMIT disputes are not
+    candidates at all — the next accepted row in the window stands in for that
+    shelf instead — and confirm weight plus author reputation break timestamp
+    ties. Otherwise a row three people called wrong could still be the headline
+    "cheapest" simply because it was posted most recently.
     """
     if not stores:
         return {}
@@ -183,37 +353,49 @@ def latest_prices(
         product_ids = [product_ids]
     store_ids = [store.id for store in stores]
     rows = session.execute(
-        _STORE_SCOPE_SQL, {"store_ids": store_ids, "product_ids": product_ids, "since": since}
+        _STORE_SCOPE_SQL,
+        {
+            "store_ids": store_ids,
+            "product_ids": product_ids,
+            "since": since,
+            **_VOTE_SUPPORT_PARAMS,
+        },
     ).mappings()
-    by_store: dict[int, Observation] = {row["store_id"]: Observation(**dict(row)) for row in rows}
+    store_candidates = [_candidate(dict(row)) for row in rows]
 
-    missing_chains = {store.chain_id for store in stores if store.id not in by_store}
-    if missing_chains:
-        chain_rows = session.execute(
+    chain_candidates = [
+        _candidate(dict(row))
+        for row in session.execute(
             _CHAIN_SCOPE_SQL,
-            {"chain_ids": sorted(missing_chains), "product_ids": product_ids, "since": since},
+            {
+                "chain_ids": sorted({store.chain_id for store in stores}),
+                "product_ids": product_ids,
+                "since": since,
+                **_VOTE_SUPPORT_PARAMS,
+            },
         ).mappings()
-        chain_prices = {row["chain_id"]: Observation(**dict(row)) for row in chain_rows}
-        for store in stores:
-            if store.id in by_store or store.chain_id not in chain_prices:
-                continue
-            chain_row = chain_prices[store.chain_id]
-            by_store[store.id] = Observation(
-                id=chain_row.id,
-                store_id=store.id,
-                chain_id=chain_row.chain_id,
-                product_id=chain_row.product_id,
-                price_cents=chain_row.price_cents,
-                was_price_cents=chain_row.was_price_cents,
-                unit_price_cents_per_l=chain_row.unit_price_cents_per_l,
-                promo_kind=chain_row.promo_kind,
-                promo_qty=chain_row.promo_qty,
-                promo_total_cents=chain_row.promo_total_cents,
-                in_stock=chain_row.in_stock,
-                source=chain_row.source,
-                price_scope="chain",
-                observed_at=chain_row.observed_at,
-            )
+    ]
+
+    store_rows = {
+        observation.store_id: observation
+        for observation, _ in store_candidates
+        if observation.store_id is not None
+    }
+    chain_rows = {observation.chain_id: observation for observation, _ in chain_candidates}
+    support = {
+        observation.id: votes for observation, votes in store_candidates + chain_candidates
+    }
+
+    by_store: dict[int, StorePrice] = {}
+    for store in stores:
+        chosen = _freshest(
+            store_rows.get(store.id),
+            chain_rows.get(store.chain_id),
+            store.id,
+            support=support,
+        )
+        if chosen is not None:
+            by_store[store.id] = chosen
     return by_store
 
 
