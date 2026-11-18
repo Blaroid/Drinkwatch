@@ -176,7 +176,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
 @router.get(
     "/value/max-caffeine",
     response_model=MaxCaffeineOut,
-    summary="Most caffeine (i.e. most millilitres) for a budget",
+    summary="Most caffeine for a budget",
 )
 def max_caffeine(
     budget_cents: int = Query(ge=100, le=200000),
@@ -284,8 +284,8 @@ def max_caffeine(
         total_ml=total_ml,
         items=output_items,
         note=(
-            "Caffeine assumes 32mg/100mL unless a product overrides it (FSANZ 2.6.4 cap), "
-            "so this ranking is effectively millilitres per dollar."
+            "Caffeine is the curated can-label value where the catalogue has one; "
+            "unlisted products fall back to the FSANZ 32mg/100mL cap."
         ),
         daily_limit_mg=settings.daily_caffeine_limit_mg,
         exceeds_daily_limit=total_mg > settings.daily_caffeine_limit_mg,

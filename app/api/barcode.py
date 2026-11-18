@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..caffeine import caffeine_from_off, plausible_caffeine
 from ..config import settings
 from ..db import get_session
 from ..models import BarcodeCache, Device, Listing, Observation, Product, Store
@@ -58,6 +59,20 @@ def _cache(session: Session, barcode: str, payload: dict) -> None:
     session.commit()
 
 
+def _cached_caffeine(session: Session, barcode: str) -> float | None:
+    """Label caffeine from the Open Food Facts payload already cached.
+
+    Deliberately no network call: the barcode GET normally populated this a
+    moment earlier, and the pending-product write should not depend on a third
+    party being up. The payload also keeps the raw ``caffeine_100g`` it came
+    from, so the mg/100 mL figure can be recomputed if the conversion changes.
+    """
+    payload = _cached(session, barcode)
+    if not payload or not payload.get("found"):
+        return None
+    return plausible_caffeine(payload.get("caffeine_mg_per_100ml"))
+
+
 def external_lookup(session: Session, barcode: str) -> dict | None:
     """Open Food Facts fallback, cached (including negative results)."""
     if not settings.off_lookup_enabled:
@@ -91,7 +106,8 @@ def external_lookup(session: Session, barcode: str) -> dict | None:
         "brand": product.get("brands"),
         "quantity": product.get("quantity"),
         "image_url": product.get("image_front_url"),
-        "caffeine_mg_per_100ml": round(float(caffeine) * 1000, 1) if caffeine else None,
+        "caffeine_100g": caffeine,
+        "caffeine_mg_per_100ml": caffeine_from_off(caffeine),
     }
     _cache(session, barcode, suggestion)
     return suggestion
@@ -210,6 +226,15 @@ def submit_pending(
     if normalised and not product.normalised_barcode:
         product.normalised_barcode = normalised
         product.barcode = product.barcode or payload.barcode
+
+    # The barcode lookup already paid for Open Food Facts; persist the label
+    # figure it returned instead of discarding it with the suggestion. Curated
+    # seed data and admin edits outrank it, hence the default-only guard.
+    if product.caffeine_source == "default":
+        caffeine = _cached_caffeine(session, normalised)
+        if caffeine is not None:
+            product.caffeine_mg_per_100ml = caffeine
+            product.caffeine_source = "openfoodfacts"
 
     observation_id = None
     if payload.price_cents and store is not None:
