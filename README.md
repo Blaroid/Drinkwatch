@@ -8,7 +8,7 @@ scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
 
 * **API + docs:** https://cans.hazzardous.online/docs
 * **Android app:** https://cans.hazzardous.online/app (sideload, ~15 MB)
-* **App source:** https://github.com/Blaroid/drinkwatch-android
+* **App source:** https://github.com/Blaroid/Drinkwatch-Android
 
 ## What it does
 
