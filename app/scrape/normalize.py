@@ -13,6 +13,10 @@ from ..models import Product
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L|litres?|liters?)\b")
 PACK_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b")
 PACK_WORD_RE = re.compile(r"\b(\d{1,2})\s*(?:pack|pk|p)\b", re.IGNORECASE)
+# "(24x Pack)" / "24x carton": count before an "x", no per-unit size.
+PACK_COUNT_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(?:pack|pk|carton|box)\b", re.IGNORECASE)
+# A token that is just a count ("24", "24x") is never a flavour.
+COUNT_TOKEN_RE = re.compile(r"^\d+x?$")
 
 MONEY_RE = re.compile(r"\$?\s*(\d{1,4}(?:\.\d{2})?)")
 
@@ -82,6 +86,11 @@ def parse_pack(text: str | None) -> tuple[int | None, int]:
     if multi:
         pack_count = int(multi.group(1))
         size_ml = _to_ml(float(multi.group(2)), multi.group(3))
+    elif PACK_COUNT_X_RE.search(text):
+        pack_count = int(PACK_COUNT_X_RE.search(text).group(1))
+        single = SIZE_RE.search(text)
+        if single:
+            size_ml = _to_ml(float(single.group(1)), single.group(2))
     else:
         single = SIZE_RE.search(text)
         if single:
@@ -179,7 +188,10 @@ def clean_flavour(name: str, brand: str | None) -> str:
     text = SIZE_RE.sub(" ", text)
     text = re.sub(r"\b\d+\s*(?:pack|pk|p)\b", " ", text, flags=re.I)
     text = re.sub(r"[^A-Za-z0-9\s'-]", " ", text)
-    words = [w for w in text.split() if w.lower() not in NOISE_TOKENS]
+    words = [
+        w for w in text.split()
+        if w.lower() not in NOISE_TOKENS and not COUNT_TOKEN_RE.match(w)
+    ]
     return " ".join(words).strip(" -")
 
 
@@ -360,8 +372,11 @@ def match_product(
     if not create:
         return None, False
 
-    flavour = clean_flavour(name, brand)
-    slug = build_slug(brand, flavour or name, None, size_ml, pack_count)
+    # Never fall back to the raw retailer title ("Red Bull Energy Drink Can
+    # 250mL"): with the brand and size stripped there is nothing left, and
+    # "original" is what those products actually are.
+    flavour = clean_flavour(name, brand) or "Original"
+    slug = build_slug(brand, flavour, None, size_ml, pack_count)
     existing = session.scalar(select(Product).where(Product.slug == slug))
     if existing is not None:
         return existing, False
@@ -370,7 +385,7 @@ def match_product(
     product = Product(
         slug=slug,
         brand=brand,
-        name=flavour or name,
+        name=flavour,
         variant=None,
         size_ml=size_ml,
         pack_count=pack_count,
