@@ -237,6 +237,9 @@ class Photo(Base):
     height: Mapped[int | None] = mapped_column(Integer)
     uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # set by scripts/photos-sync.sh when the local cache copy is deleted; the bytes then
+    # live on the backup disk only and both photo endpoints answer 410 instead of 404
+    pruned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BarcodeCache(Base):

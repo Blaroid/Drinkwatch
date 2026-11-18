@@ -457,6 +457,7 @@ def recent_photos(
             "uploaded_by": photo.uploaded_by,
             "bytes": photo.bytes,
             "created_at": photo.created_at,
+            "pruned_at": photo.pruned_at,
         }
         for photo in session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit))
     ]
