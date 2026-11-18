@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.orm import Session
 
 from .. import __version__
@@ -14,6 +14,8 @@ from ..db import get_session
 from ..models import Chain, Observation, Product, Store
 from ..schemas import (
     ChainOut,
+    DealStatsOut,
+    LeaderboardEntry,
     MetaOut,
     OfferOut,
     ProductOut,
@@ -36,6 +38,38 @@ from .deps import (
 )
 
 router = APIRouter(prefix="/v1", tags=["public"])
+
+_DEAL_STATS_SQL = text(
+    """
+    select chain_id,
+           percentile_cont(0.5) within group (order by price_cents) as median_cents,
+           min(price_cents) as min_cents,
+           count(*) as samples
+      from price_daily
+     where product_id in :product_ids
+       and day >= current_date - interval '90 days'
+     group by chain_id
+    """
+).bindparams(bindparam("product_ids", expanding=True))
+
+
+def _deal_stats(session: Session, product_ids: list[int]) -> dict[int, dict]:
+    return {
+        row["chain_id"]: dict(row)
+        for row in session.execute(_DEAL_STATS_SQL, {"product_ids": product_ids}).mappings()
+    }
+
+
+def _classify_deal(price_cents: int, median_cents: int | None, min_cents: int | None) -> str:
+    if not median_cents or median_cents <= 0:
+        return "unknown"
+    if min_cents and price_cents <= round(min_cents * 1.05):
+        return "great"
+    if price_cents <= round(median_cents * 0.95):
+        return "good"
+    if price_cents <= round(median_cents * 1.1):
+        return "typical"
+    return "high"
 
 
 def _label(product: Product) -> str:
@@ -96,6 +130,23 @@ def _offers_for_product(
             )
         )
     offers.sort(key=lambda offer: (offer.price_cents, offer.distance_km or 999))
+
+    group_ids = product_group_ids(session, product)
+    stats = _deal_stats(session, group_ids)
+    for offer in offers:
+        store_pair = by_id.get(offer.store_id)
+        if store_pair is None:
+            continue
+        row = stats.get(store_pair[0].chain_id)
+        if not row or (row.get("samples") or 0) < 3:
+            continue
+        median = round(row["median_cents"]) if row.get("median_cents") else None
+        minimum = row.get("min_cents")
+        offer.stats = DealStatsOut(
+            median_90d_cents=median,
+            min_90d_cents=minimum,
+            deal=_classify_deal(offer.price_cents, median, minimum),
+        )
     return offers
 
 
@@ -335,3 +386,111 @@ def observations(
         }
         for row in rows
     ]
+
+
+@router.get("/stores/search", response_model=list[StoreOut], summary="Find a store by name, suburb or postcode")
+def stores_search(
+    q: str = Query(min_length=1, max_length=60),
+    lat: float | None = Query(default=None, ge=-90, le=90),
+    lon: float | None = Query(default=None, ge=-180, le=180),
+    radius_km: float | None = Query(default=None, gt=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> list[StoreOut]:
+    """Text search over store name, suburb, postcode and chain name.
+
+    When lat/lon are supplied the results are distance-annotated; a name that
+    starts with the query outranks a substring hit, which then outranks a chain
+    name hit (so "spud" finds the SpudSheds before every Woolworths).
+    """
+    needle = f"%{q.strip().lower()}%"
+    prefix = f"{q.strip().lower()}%"
+    rows = list(
+        session.scalars(
+            select(Store)
+            .join(Chain, Chain.id == Store.chain_id)
+            .where(
+                Store.is_active.is_(True),
+                func.lower(Store.name).like(needle)
+                | func.lower(func.coalesce(Store.suburb, "")).like(needle)
+                | func.coalesce(Store.postcode, "").like(needle)
+                | func.lower(Chain.name).like(needle),
+            )
+            .limit(300)
+        )
+    )
+
+    def rank(store: Store) -> tuple:
+        name = (store.name or "").lower()
+        suburb = (store.suburb or "").lower()
+        if name.startswith(prefix) or suburb.startswith(prefix):
+            bucket = 0
+        elif q.strip().lower() in name or q.strip().lower() in suburb:
+            bucket = 1
+        else:
+            bucket = 2
+        return bucket
+
+    ranked = sorted(rows, key=rank)
+    if lat is not None and lon is not None:
+        from .deps import haversine_km
+
+        radius = clamp_radius(radius_km) if radius_km else None
+        annotated = []
+        for store in ranked:
+            if store.lat is None or store.lon is None:
+                continue
+            distance = haversine_km(lat, lon, store.lat, store.lon)
+            if radius is not None and distance > radius:
+                continue
+            annotated.append((store, round(distance, 2)))
+        annotated.sort(key=lambda pair: (rank(pair[0]), pair[1]))
+        annotated = annotated[:limit]
+        result = []
+        for store, distance in annotated:
+            item = StoreOut.model_validate(store)
+            item.distance_km = distance
+            result.append(item)
+        return result
+
+    return [StoreOut.model_validate(store) for store in ranked[:limit]]
+
+
+@router.get("/leaderboard", response_model=list[LeaderboardEntry], summary="Top crowd contributors")
+def leaderboard(
+    period: str = Query(default="week", pattern="^(week|month|all)$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> list[LeaderboardEntry]:
+    from datetime import timedelta
+
+    from ..models import Device
+
+    stmt = (
+        select(Observation.device_id, func.count().label("accepted"))
+        .where(
+            Observation.source == "crowd",
+            Observation.status == "accepted",
+            Observation.device_id.is_not(None),
+        )
+        .group_by(Observation.device_id)
+        .order_by(func.count().desc())
+        .limit(limit)
+    )
+    if period != "all":
+        days = 7 if period == "week" else 30
+        stmt = stmt.where(Observation.observed_at >= utcnow() - timedelta(days=days))
+
+    entries: list[LeaderboardEntry] = []
+    for rank, row in enumerate(session.execute(stmt).all(), start=1):
+        device = session.get(Device, row[0])
+        label = (device.display_name if device else None) or f"anon-{str(row[0]).zfill(3)}"
+        entries.append(
+            LeaderboardEntry(
+                rank=rank,
+                device=label,
+                reputation=device.reputation if device else 0,
+                accepted=int(row[1]),
+            )
+        )
+    return entries

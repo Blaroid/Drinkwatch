@@ -365,3 +365,105 @@ def devices(limit: int = Query(default=100, ge=1, le=500), session: Session = De
         }
         for device in session.scalars(select(Device).order_by(Device.id.desc()).limit(limit))
     ]
+
+
+@router.get("/products/pending", summary="Crowd-submitted products awaiting review")
+def pending_products(
+    limit: int = Query(default=100, ge=1, le=500), session: Session = Depends(get_session)
+) -> list[dict]:
+    rows = session.execute(
+        select(Product, func.count(Observation.id))
+        .outerjoin(Observation, Observation.product_id == Product.id)
+        .where(Product.status == "pending")
+        .group_by(Product.id)
+        .order_by(Product.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "slug": product.slug,
+            "brand": product.brand,
+            "name": product.name,
+            "size_ml": product.size_ml,
+            "pack_count": product.pack_count,
+            "barcode": product.normalised_barcode or product.barcode,
+            "observations": int(count or 0),
+            "created_at": product.created_at,
+        }
+        for product, count in rows
+    ]
+
+
+class ApproveRequest(BaseModel):
+    caffeine_mg_per_100ml: float | None = Field(default=None, ge=0, le=200)
+    size_ml: int | None = Field(default=None, ge=50, le=5000)
+    pack_count: int | None = Field(default=None, ge=1, le=48)
+    merge_into_slug: str | None = None
+
+
+@router.post("/products/{slug}/approve", summary="Confirm a crowd-submitted product")
+def approve_product(
+    slug: str, payload: ApproveRequest, session: Session = Depends(get_session)
+) -> dict:
+    product = session.scalar(select(Product).where(Product.slug == slug))
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown product")
+
+    if payload.size_ml is not None:
+        product.size_ml = payload.size_ml
+    if payload.pack_count is not None:
+        product.pack_count = payload.pack_count
+    if payload.caffeine_mg_per_100ml is not None:
+        product.caffeine_mg_per_100ml = payload.caffeine_mg_per_100ml
+    product.status = "verified"
+
+    if payload.merge_into_slug:
+        target = session.scalar(select(Product).where(Product.slug == payload.merge_into_slug))
+        if target is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown merge target")
+        product.canonical_product_id = target.canonical_product_id or target.id
+
+    product.family_slug = product.family_slug or __import__("re").sub(r"-x[0-9]+$", "", product.slug)
+    session.commit()
+    return {
+        "slug": product.slug,
+        "status": product.status,
+        "canonical_product_id": product.canonical_product_id,
+    }
+
+
+@router.post("/products/{slug}/reject", summary="Reject a crowd-submitted product")
+def reject_product(slug: str, session: Session = Depends(get_session)) -> dict:
+    product = session.scalar(select(Product).where(Product.slug == slug))
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown product")
+    product.status = "rejected"
+    product.is_active = False
+    session.commit()
+    return {"slug": product.slug, "status": product.status}
+
+
+@router.get("/photos", summary="Recent uploaded photos for moderation")
+def recent_photos(
+    limit: int = Query(default=50, ge=1, le=200), session: Session = Depends(get_session)
+) -> list[dict]:
+    from ..models import Photo
+
+    return [
+        {
+            "id": photo.id,
+            "token": photo.token,
+            "url": f"/v1/photos/{photo.token}",
+            "uploaded_by": photo.uploaded_by,
+            "bytes": photo.bytes,
+            "created_at": photo.created_at,
+        }
+        for photo in session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit))
+    ]
+
+
+@router.post("/alerts/evaluate", summary="Run the price-alert evaluation now")
+def run_alerts(session: Session = Depends(get_session)) -> dict:
+    from ..notify import evaluate_alerts
+
+    return {"notifications_created": evaluate_alerts(session)}

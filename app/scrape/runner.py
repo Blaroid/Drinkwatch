@@ -55,6 +55,13 @@ def run_chains(codes: list[str], store_ids: list[int] | None = None) -> dict[str
                     session.rollback()
                 finish_run(session, run, stats, error=error)
                 results[code] = stats.as_dict()
+                if stats.observations_written:
+                    from ..notify import evaluate_alerts
+
+                    try:
+                        results[code]["alerts_queued"] = evaluate_alerts(session)
+                    except Exception:  # pragma: no cover - alerting must not break scraping
+                        log.exception("alert evaluation failed")
                 log.info("%s scrape: %s", code, results[code])
     finally:
         _LOCK.release()

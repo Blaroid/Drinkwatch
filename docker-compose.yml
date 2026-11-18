@@ -28,6 +28,8 @@ services:
       - ./app:/srv/app:ro
       - ./scripts:/srv/scripts:ro
       - ./migrations:/srv/migrations:ro
+      # price-tag photos: point PHOTOS_HOST_DIR at the redmax backup disk
+      - ${PHOTOS_HOST_DIR:-./photos}:/srv/photos
 
 volumes:
   pgdata:

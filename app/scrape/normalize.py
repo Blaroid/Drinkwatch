@@ -47,6 +47,9 @@ STRICT_BRANDS = {
 }
 # Brands with both energy and non-energy ranges: require an energy word.
 LOOSE_BRANDS = {"Dare", "Prime"}
+
+# Brands that share the "energy" search keywords but are not energy drinks.
+CATEGORY_BY_BRAND = {"Dare": "iced-coffee", "Prime": "hydration"}
 ENERGY_WORD = re.compile(r"\benergy\b|\biced coffee\b|\bhydration\b", re.I)
 
 NOISE_TOKENS = {
@@ -134,6 +137,14 @@ def detect_brand(name: str) -> str | None:
     return None
 
 
+def classify_category(brand: str | None, name: str) -> str:
+    if brand in CATEGORY_BY_BRAND:
+        return CATEGORY_BY_BRAND[brand]
+    if re.search(r"\biced coffee\b", name, re.I):
+        return "iced-coffee"
+    return "energy"
+
+
 def is_energy_item(name: str, brand: str | None = None, size_ml: int | None = None) -> bool:
     """Decide whether a retailer search hit is really an energy drink.
 
@@ -170,6 +181,100 @@ def clean_flavour(name: str, brand: str | None) -> str:
     text = re.sub(r"[^A-Za-z0-9\s'-]", " ", text)
     words = [w for w in text.split() if w.lower() not in NOISE_TOKENS]
     return " ".join(words).strip(" -")
+
+
+def normalize_barcode(raw: str | None) -> str | None:
+    """Canonical 13-digit barcode.
+
+    Retailers hand out GTIN-14 (Woolworths prefixes 13-digit EANs with a packaging
+    "1"), UPC-A 12-digit codes, and the odd internal synthetic code. Normalise to
+    EAN-13 so the same can always matches itself.
+    """
+    if not raw:
+        return None
+    digits = re.sub(r"[^0-9]", "", str(raw))
+    if not digits:
+        return None
+    if len(digits) == 14:
+        if digits[0] in {"1", "0"}:
+            digits = digits[1:]
+        else:
+            digits = digits.lstrip("0")
+    if len(digits) == 12:
+        digits = "0" + digits
+    if len(digits) > 13:
+        digits = digits.lstrip("0")
+    return digits if 8 <= len(digits) <= 13 else None
+
+
+def barcode_variants(raw: str | None) -> list[str]:
+    """Every plausible key for one physical product code, most canonical first.
+
+    Woolworths hands out GTIN-14 strings whose check digit does not survive
+    stripping the packaging indicator, and some codes are retailer inventions.
+    Indexing all forms keeps matching lossless.
+    """
+    if not raw:
+        return []
+    digits = re.sub(r"[^0-9]", "", str(raw))
+    if not digits:
+        return []
+    variants: list[str] = [digits]
+    if len(digits) == 14 and digits[0] in {"1", "0"}:
+        variants.append(digits[1:])
+        variants.append(digits[1:].lstrip("0") or digits[1:])
+    if len(digits) == 13:
+        variants.append("0" + digits)
+    if len(digits) == 12:
+        variants.append("0" + digits)
+    if digits.startswith("0"):
+        variants.append(digits.lstrip("0"))
+    seen: list[str] = []
+    for candidate in variants:
+        if 8 <= len(candidate) <= 14 and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
+def register_barcode(session, product_id: int, raw: str | None, source: str = "scrape") -> int:
+    """Index every variant of a code against a product (idempotent)."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from ..models import Barcode
+
+    written = 0
+    for variant in barcode_variants(raw):
+        statement = (
+            pg_insert(Barcode)
+            .values(barcode=variant, product_id=product_id, source=source)
+            .on_conflict_do_nothing(index_elements=["barcode"])
+        )
+        written += 1 if session.execute(statement).rowcount else 0
+    return written
+
+
+def ean13_checksum_ok(barcode: str | None) -> bool:
+    """Validate the mod-10 check digit (8/12/13/14 digit GTINs)."""
+    if not barcode or not barcode.isdigit():
+        return False
+    body, check = barcode[:-1], int(barcode[-1])
+    total = 0
+    for index, char in enumerate(reversed(body)):
+        total += int(char) * (3 if index % 2 == 0 else 1)
+    return (10 - total % 10) % 10 == check
+
+
+def family_slug_for(slug: str) -> str:
+    """monster-ultra-500ml-x4 -> monster-ultra-500ml (pack size folded away)."""
+    return re.sub(r"-x[0-9]+$", "", slug)
+
+
+def caffeine_mg_for(product) -> float:
+    """Caffeine in one unit (can/bottle) of a product, in mg."""
+    per_100 = float(product.caffeine_mg_per_100ml or 0)
+    if not product.size_ml:
+        return 0.0
+    return per_100 * product.size_ml / 100.0
 
 
 def slugify(value: str) -> str:
@@ -216,7 +321,13 @@ def match_product(
     Returns (product, created).
     """
     if barcode:
-        hit = session.scalar(select(Product).where(Product.barcode == barcode))
+        from ..models import Barcode
+
+        hit = session.scalar(
+            select(Product)
+            .join(Barcode, Barcode.product_id == Product.id)
+            .where(Barcode.barcode.in_(barcode_variants(barcode)))
+        )
         if hit is not None:
             return hit, False
 
@@ -255,6 +366,7 @@ def match_product(
     if existing is not None:
         return existing, False
 
+    barcode_norm = normalize_barcode(barcode)
     product = Product(
         slug=slug,
         brand=brand,
@@ -263,11 +375,16 @@ def match_product(
         size_ml=size_ml,
         pack_count=pack_count,
         barcode=barcode,
-        category=category,
+        normalised_barcode=barcode_norm,
+        family_slug=family_slug_for(slug),
+        category=classify_category(brand, name) if category == "energy" else category,
         source="auto",
+        status="verified",
     )
     session.add(product)
     session.flush()
+    if barcode:
+        register_barcode(session, product.id, barcode, source="scrape")
     return product, True
 
 

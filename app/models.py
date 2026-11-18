@@ -7,18 +7,21 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     SmallInteger,
     String,
     Text,
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -81,6 +84,14 @@ class Product(Base):
     canonical_product_id: Mapped[int | None] = mapped_column(
         ForeignKey("products.id", ondelete="SET NULL")
     )
+    # same drink ignoring pack size, e.g. monster-ultra-500ml for ...-500ml-x4
+    family_slug: Mapped[str | None] = mapped_column(String(160))
+    # AU formulated caffeinated beverages are capped at 32mg/100mL (FSANZ 2.6.4)
+    caffeine_mg_per_100ml: Mapped[float] = mapped_column(Numeric(5, 2), default=32)
+    # verified | pending | rejected
+    status: Mapped[str] = mapped_column(String(16), default="verified")
+    image_url: Mapped[str | None] = mapped_column(String(500))
+    normalised_barcode: Mapped[str | None] = mapped_column(String(14))
     category: Mapped[str] = mapped_column(String(40), default="energy")
     # auto | manual
     source: Mapped[str] = mapped_column(String(16), default="auto")
@@ -160,6 +171,8 @@ class Observation(Base):
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
     note: Mapped[str | None] = mapped_column(String(300))
     photo_url: Mapped[str | None] = mapped_column(String(500))
+    photo_id: Mapped[int | None] = mapped_column(ForeignKey("photos.id", ondelete="SET NULL"))
+    ocr_text: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # accepted | needs_review | rejected
@@ -207,3 +220,101 @@ class ScrapeRun(Base):
     observations_written: Mapped[int] = mapped_column(Integer, default=0)
     products_created: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class Photo(Base):
+    """An uploaded price-tag or shelf photo (EXIF-stripped, stored on disk)."""
+
+    __tablename__ = "photos"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True)
+    filename: Mapped[str] = mapped_column(String(300))
+    content_type: Mapped[str] = mapped_column(String(60), default="image/jpeg")
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    uploaded_by: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BarcodeCache(Base):
+    """Cached external barcode lookups (including negative results)."""
+
+    __tablename__ = "barcode_cache"
+
+    barcode: Mapped[str] = mapped_column(String(20), primary_key=True)
+    source: Mapped[str] = mapped_column(String(40))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PriceAlert(Base):
+    __tablename__ = "price_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
+    family_slug: Mapped[str | None] = mapped_column(String(160))
+    chain_code: Mapped[str | None] = mapped_column(String(32))
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"))
+    max_price_cents: Mapped[int] = mapped_column(Integer)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(20), default="alert")
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CaffeineEntry(Base):
+    __tablename__ = "caffeine_entries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
+    label: Mapped[str | None] = mapped_column(String(160))
+    qty: Mapped[int] = mapped_column(Integer, default=1)
+    mg_caffeine: Mapped[int] = mapped_column(Integer)
+    consumed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Barcode(Base):
+    """A code form (EAN-13, GTIN-14, UPC-A, retailer code) mapping to a product."""
+
+    __tablename__ = "barcodes"
+
+    barcode: Mapped[str] = mapped_column(String(20), primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
+    source: Mapped[str] = mapped_column(String(20), default="scrape")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PriceDaily(Base):
+    """One row per (day, chain, product): the history behind deal badges."""
+
+    __tablename__ = "price_daily"
+
+    day: Mapped[datetime] = mapped_column(Date, primary_key=True)
+    chain_id: Mapped[int] = mapped_column(
+        ForeignKey("chains.id", ondelete="CASCADE"), primary_key=True
+    )
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), primary_key=True
+    )
+    price_cents: Mapped[int] = mapped_column(Integer)
+    was_price_cents: Mapped[int | None] = mapped_column(Integer)
+    promo_kind: Mapped[str] = mapped_column(String(16), default="none")
+    source: Mapped[str] = mapped_column(String(10), default="scrape")

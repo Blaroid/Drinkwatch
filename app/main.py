@@ -12,7 +12,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles  # noqa: F401  (kept for future admin UI)
 
 from . import __version__
-from .api import admin, crowd, public
+from .api import admin, alerts, barcode, basket, crowd, photos, public
 from .config import settings
 from .db import init_db, wait_for_db
 
@@ -59,6 +59,10 @@ app.add_middleware(
 )
 
 app.include_router(public.router)
+app.include_router(barcode.router)
+app.include_router(basket.router)
+app.include_router(alerts.router)
+app.include_router(photos.router)
 app.include_router(crowd.router)
 app.include_router(admin.router)
 

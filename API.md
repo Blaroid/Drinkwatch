@@ -155,3 +155,137 @@ Your own history and profile:
     {"detail": "unknown product slug: foo"}    // 404, 422, 409, 429, 401, 403
 
 429 responses carry `Retry-After`. 503 on /v1/admin/* means ADMIN_TOKEN is unset.
+
+
+## Scanning and onboarding
+
+    GET /v1/barcode/{barcode}
+    200 {"found": true, "barcode": "19342866000496", "normalised": "9342866000496",
+         "checksum_ok": true, "product": {...}}
+    200 {"found": false, "barcode": "9300633099999", "normalised": "9300633099999",
+         "checksum_ok": false, "suggestion": null,
+         "pending_hint": "No match. Ask the user for the name and size on the can, then POST /v1/products/pending"}
+
+Accepts EAN-13, GTIN-14 (Woolworths' 14-digit codes), UPC-A and retailer-internal
+codes; all forms of the same product resolve. `checksum_ok` is advisory - some
+retailer codes are not valid GTINs.
+
+    POST /v1/products/pending            (device auth)
+    {"barcode": "9300633099999", "name": "V Energy Berry 500mL", "brand": "V",
+     "size_ml": 500, "pack_count": 1, "photo_token": "...", "store_id": 556,
+     "price_cents": 350, "note": "front fridge"}
+    201 {"product": {...}, "created": true, "observation_id": 21448}
+
+Creates a `pending` product (name is required - that is the point) and optionally a
+price sighting. If the barcode already resolves, it returns that product with
+`created: false` and just attaches the price.
+
+## Photos
+
+    POST /v1/photos        (device auth, multipart form field "file")
+
+    201 {"id": 3, "token": "tRnEh5kz...", "url": "https://.../v1/photos/tRnEh5kz...",
+         "content_type": "image/jpeg", "bytes": 311, "width": 64, "height": 64,
+         "created_at": "..."}
+
+Max 8 MB, images only. EXIF (including GPS) is stripped by re-encoding, max
+dimension 1600 px. Same image from the same device returns the existing row.
+
+    GET /v1/photos/{token}     -> image/jpeg (immutable cache), 404 unknown, 410 file gone
+
+## Plans
+
+    POST /v1/basket/compare
+    {"items": [{"slug": "monster-ultra-500ml", "quantity": 4},
+               {"slug": "v-blue-250ml", "quantity": 2}],
+     "lat": -31.9523, "lon": 115.8613, "radius_km": 15}
+
+`slug` may be a product slug or a family slug (pack size folded away). Each store
+gets the cheapest legal combination of singles, packs and multibuys:
+
+    200 {"stores": [{"store_name": "Woolworths Perth Cultural Centre",
+                     "total_cents": 1910, "total": "$19.10", "complete": true,
+                     "distance_km": 0.11,
+                     "items": [{"requested": "monster-ultra-500ml", "units": 4,
+                                "cost_cents": 1380, "price": "$13.80",
+                                "breakdown": ["4 x single @ $3.45"]}]}],
+         "best_single_store": {...}, "multi_store_total_cents": 1910,
+         "multi_store_plan": [{"requested": "...", "store_name": "...", "cost_cents": 875}],
+         "savings_vs_worst_cents": 3988}
+
+Stores that cannot cover every item come back with `complete: false` and sort last.
+
+    GET /v1/value/max-caffeine?budget_cents=2000&lat=-31.9523&lon=115.8613
+        &radius_km=25&mode=single_store|multi_store&include_specials=true
+
+    200 {"budget_cents": 2000, "mode": "single_store", "spent_cents": 1740,
+         "leftover_cents": 260, "total_caffeine_mg": 1280, "total_ml": 4000,
+         "items": [{"slug": "mother-original-500ml-x4", "units": 8,
+                    "cost": "$17.40", "caffeine_mg": 1280,
+                    "store_name": "Woolworths Perth Cultural Centre", "chain_code": "woolworths"}],
+         "note": "Caffeine assumes 32mg/100mL unless a product overrides it ...",
+         "daily_limit_mg": 400, "exceeds_daily_limit": true, "stores_used": 1}
+
+Exact integer knapsack (bundles are indivisible). Budget above `MAX_BUDGET_CENTS`
+returns 422.
+
+    GET /v1/plan/route?items=monster-ultra-500ml:4,v-blue-250ml:2&lat=&lon=&radius_km=
+
+    {"stops": [{"store_name": "...", "subtotal_cents": 1910, "items": [...],
+                "distance_from_origin_km": 0.11}],
+     "items_total_cents": 1910, "travel_km": 0.2, "fuel_price_cents_per_l": 185,
+     "fuel_cost_cents": 3, "total_cost_cents": 1913,
+     "single_store_baseline_cents": 1910, "net_saving_cents": -3,
+     "fuel_source": "fuelwatch"}
+
+## Alerts, notifications, caffeine
+
+    POST   /v1/alerts      {"product_slug": "monster-ultra-500ml", "max_price_cents": 800,
+                            "chain_code": null, "store_id": null}      (device auth)
+    GET    /v1/alerts                                                    (device auth)
+    DELETE /v1/alerts/{id}                                               (device auth, deactivates)
+    GET    /v1/notifications?unread_only=true&limit=50                   (device auth)
+    POST   /v1/notifications/{id}/read                                   (device auth)
+
+    POST /v1/caffeine      {"product_slug": "monster-ultra-500ml", "qty": 1}
+                            or {"label": "barista flat white", "mg_caffeine": 120, "qty": 1}
+    GET  /v1/caffeine/today
+    200 {"date": "2026-11-18", "total_mg": 160, "limit_mg": 400,
+         "remaining_mg": 240, "entries": [...]}
+
+Alerts fire at most once per 24 h per alert. Delivery is pull-based until you add
+FCM credentials; the notification `payload` is already FCM-shaped.
+
+## Batch and receipts
+
+    POST /v1/observations/batch       (device auth)
+    {"items": [ {<ObservationIn>}, {<ObservationIn>} ]}
+    200 [{"index": 0, "status": "accepted", "observation_id": 21448},
+         {"index": 1, "status": "error", "error": "unknown store"}]
+
+    POST /v1/receipts/parse           (device auth)
+    {"text": "MONSTER ULTRA 4PK 17.50\nV ENERGY BLUE 250ML 3.29\nBANANAS 4.50"}
+    200 [{"line": "MONSTER ULTRA 4PK 17.50", "price_cents": 1750,
+          "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 0.67}]
+
+OCR happens on the device (ML Kit); this endpoint only matches the text to the
+catalogue so the user can confirm a whole docket at once.
+
+## Discovery
+
+    GET /v1/stores/search?q=spud&lat=-31.9523&lon=115.8613&limit=20
+
+Matches store name, suburb, postcode and chain name; prefix matches rank above
+substring matches, and distance annotates (and sorts) when lat/lon are given.
+
+    GET /v1/leaderboard?period=week|month|all
+    200 [{"rank": 1, "device": "Blaine", "reputation": 12, "accepted": 9}]
+
+## Admin additions
+
+    GET  /v1/admin/products/pending
+    POST /v1/admin/products/{slug}/approve   {"size_ml": 500, "caffeine_mg_per_100ml": 32,
+                                              "merge_into_slug": null}
+    POST /v1/admin/products/{slug}/reject
+    GET  /v1/admin/photos?limit=50
+    POST /v1/admin/alerts/evaluate           -> {"notifications_created": 1}

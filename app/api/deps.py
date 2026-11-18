@@ -92,6 +92,80 @@ _CHAIN_SCOPE_SQL = text(
 ).bindparams(bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True))
 
 
+_BULK_STORE_SQL = text(
+    """
+    select distinct on (o.store_id, o.product_id)
+           o.store_id, o.product_id, o.price_cents, o.was_price_cents,
+           o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
+           o.in_stock, o.source, o.price_scope, o.observed_at
+    from observations o
+    where o.store_id in :store_ids
+      and o.product_id in :product_ids
+      and o.status = 'accepted'
+      and o.observed_at >= :since
+    order by o.store_id, o.product_id, o.observed_at desc, o.id desc
+    """
+).bindparams(
+    bindparam("store_ids", expanding=True), bindparam("product_ids", expanding=True)
+)
+
+_BULK_CHAIN_SQL = text(
+    """
+    select distinct on (o.chain_id, o.product_id)
+           o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
+           o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
+           o.in_stock, o.source, o.price_scope, o.observed_at
+    from observations o
+    where o.chain_id in :chain_ids
+      and o.product_id in :product_ids
+      and o.store_id is null
+      and o.status = 'accepted'
+      and o.observed_at >= :since
+    order by o.chain_id, o.product_id, o.observed_at desc, o.id desc
+    """
+).bindparams(
+    bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True)
+)
+
+
+def bulk_latest_prices(
+    session: Session,
+    stores: list[Store],
+    product_ids: list[int],
+    since: datetime,
+) -> dict[tuple[int, int], dict]:
+    """Latest accepted price for every (store, product) pair in two queries.
+
+    Store-specific sightings win; chain-wide online prices are attributed to each
+    store of that chain, same rule as latest_prices().
+    """
+    if not stores or not product_ids:
+        return {}
+    store_ids = [store.id for store in stores]
+    chain_ids = sorted({store.chain_id for store in stores})
+    rows = session.execute(
+        _BULK_STORE_SQL,
+        {"store_ids": store_ids, "product_ids": product_ids, "since": since},
+    ).mappings()
+    found: dict[tuple[int, int], dict] = {
+        (row["store_id"], row["product_id"]): dict(row) for row in rows
+    }
+    chain_rows = session.execute(
+        _BULK_CHAIN_SQL,
+        {"chain_ids": chain_ids, "product_ids": product_ids, "since": since},
+    ).mappings()
+    chain_prices = {(row["chain_id"], row["product_id"]): dict(row) for row in chain_rows}
+    for store in stores:
+        for product_id in product_ids:
+            key = (store.id, product_id)
+            if key in found:
+                continue
+            row = chain_prices.get((store.chain_id, product_id))
+            if row is not None:
+                found[key] = {**row, "store_id": store.id, "price_scope": "chain"}
+    return found
+
+
 def latest_prices(
     session: Session,
     stores: list[Store],

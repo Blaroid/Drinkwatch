@@ -51,5 +51,24 @@ def start_scheduler() -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
+    # Alert evaluation also runs after scrapes; this catches crowd-driven changes.
+    scheduler.add_job(
+        safe_alerts,
+        IntervalTrigger(minutes=30),
+        id="alerts",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     return scheduler
+
+
+def safe_alerts() -> None:
+    from .db import session_scope
+    from .notify import evaluate_alerts
+
+    try:
+        with session_scope() as session:
+            evaluate_alerts(session)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("scheduled alert evaluation failed")

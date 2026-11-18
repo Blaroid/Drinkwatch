@@ -27,6 +27,14 @@ class Settings:
     max_radius_km: float
     default_max_age_hours: int
     max_price_cents: int
+    photos_dir: str
+    photos_max_bytes: int
+    off_lookup_enabled: bool
+    fuelwatch_enabled: bool
+    vehicle_l_per_100km: float
+    fuel_price_cents_per_l: int
+    max_budget_cents: int
+    daily_caffeine_limit_mg: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -56,6 +64,14 @@ class Settings:
             max_radius_km=float(os.environ.get("MAX_RADIUS_KM", "100")),
             default_max_age_hours=int(os.environ.get("DEFAULT_MAX_AGE_HOURS", "72")),
             max_price_cents=int(os.environ.get("MAX_PRICE_CENTS", "50000")),
+            photos_dir=os.environ.get("PHOTOS_DIR", "/srv/photos"),
+            photos_max_bytes=int(os.environ.get("PHOTOS_MAX_BYTES", str(8 * 1024 * 1024))),
+            off_lookup_enabled=_flag("OFF_LOOKUP_ENABLED", True),
+            fuelwatch_enabled=_flag("FUELWATCH_ENABLED", True),
+            vehicle_l_per_100km=float(os.environ.get("VEHICLE_L_PER_100KM", "8.5")),
+            fuel_price_cents_per_l=int(os.environ.get("FUEL_PRICE_CENTS_PER_L", "180")),
+            max_budget_cents=int(os.environ.get("MAX_BUDGET_CENTS", "20000")),
+            daily_caffeine_limit_mg=int(os.environ.get("DAILY_CAFFEINE_LIMIT_MG", "400")),
         )
 
 

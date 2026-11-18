@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -12,11 +13,15 @@ from ..config import settings
 from ..db import get_session
 from ..models import Device, Observation, ObservationVote, Product, Store
 from ..schemas import (
+    BatchObservationIn,
+    BatchObservationResult,
     DeviceMeOut,
     DeviceOut,
     DeviceRegisterIn,
     ObservationIn,
     ObservationOut,
+    ReceiptCandidate,
+    ReceiptParseIn,
     ReportIn,
     VoteIn,
 )
@@ -290,3 +295,90 @@ def my_observations(
         )
     )
     return _serialize(session, rows)
+
+
+@router.post("/observations/batch", response_model=list[BatchObservationResult], summary="Submit many sightings at once (receipt flow)")
+def submit_batch(
+    payload: BatchObservationIn,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> list[BatchObservationResult]:
+    """Same validation as /v1/observations, one row per item, per-item errors."""
+    results: list[BatchObservationResult] = []
+    for index, item in enumerate(payload.items):
+        try:
+            saved = submit_observation(item, authorization=authorization, session=session)
+            results.append(
+                BatchObservationResult(index=index, status=saved.status, observation_id=saved.id)
+            )
+        except HTTPException as exc:
+            session.rollback()
+            results.append(
+                BatchObservationResult(index=index, status="error", error=str(exc.detail))
+            )
+    return results
+
+
+@router.post("/receipts/parse", response_model=list[ReceiptCandidate], summary="Match OCR receipt lines to products")
+def parse_receipt(
+    payload: ReceiptParseIn,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> list[ReceiptCandidate]:
+    """The app does the OCR (ML Kit); this matches the text lines to our catalogue.
+
+    Returns the best product guess per line so the user only has to confirm.
+    """
+    from ..scrape.normalize import flavour_tokens
+    from sqlalchemy import select as _select
+
+    device = current_device(authorization, session=session)
+    read_limiter.check(f"receipt:{device.id}")
+    session.commit()
+
+    products = list(
+        session.scalars(_select(Product).where(Product.status != "rejected", Product.is_active.is_(True)))
+    )
+    index = [
+        (product, flavour_tokens(f"{product.brand} {product.name} {product.variant or ''}"))
+        for product in products
+    ]
+
+    price_pattern = re.compile(r"\$?\s*(\d{1,3}\.\d{2})\s*$")
+    candidates: list[ReceiptCandidate] = []
+    for raw_line in payload.text.splitlines()[:120]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = price_pattern.search(line)
+        price_cents = None
+        name_part = line
+        if match:
+            price_cents = round(float(match.group(1)) * 100)
+            name_part = line[: match.start()].strip()
+        if len(name_part) < 3:
+            continue
+        wanted = flavour_tokens(name_part)
+        best_product = None
+        best_score = 0.0
+        for product, tokens in index:
+            if not tokens or not wanted:
+                continue
+            score = len(wanted & tokens) / len(wanted | tokens)
+            if score > best_score:
+                best_score = score
+                best_product = product
+        candidates.append(
+            ReceiptCandidate(
+                line=line,
+                price_cents=price_cents,
+                product_slug=best_product.slug if best_product and best_score >= 0.34 else None,
+                label=(
+                    f"{best_product.brand} {best_product.name}"
+                    if best_product and best_score >= 0.34
+                    else None
+                ),
+                score=round(best_score, 2),
+            )
+        )
+    return candidates
