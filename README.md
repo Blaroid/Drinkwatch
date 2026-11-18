@@ -159,8 +159,10 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
   normalisation.
 * `observations` is the append-only price ledger. `store_id` is NULL for
   chain-wide online prices. A `dedupe_key` makes scraper writes idempotent.
-* `price_daily` keeps one row per (day, chain, product) so deal badges still have
-  history when a price does not change for weeks.
+* `price_daily` keeps one row per (day, chain, product, store) so deal badges still
+  have history when a price does not change for weeks. A chain-level row
+  (`store_id` NULL) carries the chain's published price, or the median of its
+  stores when the chain only prices per store.
 
 ## Versioning
 
@@ -171,6 +173,7 @@ change bumps it and lands as one commit:
     0.1.1  clean product names ("Original" fallback)
     0.2.0  typo-tolerant product search (pg_trgm)
     0.3.1  /v1/widget?suggest for "end of your list" suggestions
+    0.3.3  price_daily keeps a row per store, plus the chain-level aggregate
     docs   README / API.md only, no version bump
 
 ## Legal and etiquette

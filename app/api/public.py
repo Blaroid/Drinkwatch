@@ -43,22 +43,47 @@ router = APIRouter(prefix="/v1", tags=["public"])
 _DEAL_STATS_SQL = text(
     """
     select chain_id,
+           store_id,
            percentile_cont(0.5) within group (order by price_cents) as median_cents,
            min(price_cents) as min_cents,
            count(*) as samples
       from price_daily
      where product_id in :product_ids
        and day >= current_date - interval '90 days'
-     group by chain_id
+     group by chain_id, store_id
     """
 ).bindparams(bindparam("product_ids", expanding=True))
 
+# Below this many daily samples a scope's history is a couple of odd days, not a
+# price level, so the badge stays unset rather than guessing.
+_MIN_DEAL_SAMPLES = 3
 
-def _deal_stats(session: Session, product_ids: list[int]) -> dict[int, dict]:
+
+def _deal_stats(session: Session, product_ids: list[int]) -> dict[tuple[int, int | None], dict]:
+    """90-day history per (chain, store); a None store is the chain-level row."""
     return {
-        row["chain_id"]: dict(row)
+        (row["chain_id"], row["store_id"]): dict(row)
         for row in session.execute(_DEAL_STATS_SQL, {"product_ids": product_ids}).mappings()
     }
+
+
+def _deal_row(
+    stats: dict[tuple[int, int | None], dict], chain_id: int, store_id: int | None
+) -> dict | None:
+    """The history an offer should be judged against.
+
+    An offer is one shop's price, so it is judged against that shop's own 90
+    days. Chains that publish one price state-wide (Woolworths, Coles) write no
+    store rows, and a store with too little history of its own, so both fall
+    back to the chain-level row the writers keep aggregated.
+    """
+    own = stats.get((chain_id, store_id))
+    if own and (own.get("samples") or 0) >= _MIN_DEAL_SAMPLES:
+        return own
+    chain_row = stats.get((chain_id, None))
+    if chain_row and (chain_row.get("samples") or 0) >= _MIN_DEAL_SAMPLES:
+        return chain_row
+    return None
 
 
 def _classify_deal(price_cents: int, median_cents: int | None, min_cents: int | None) -> str:
@@ -138,8 +163,8 @@ def _offers_for_product(
         store_pair = by_id.get(offer.store_id)
         if store_pair is None:
             continue
-        row = stats.get(store_pair[0].chain_id)
-        if not row or (row.get("samples") or 0) < 3:
+        row = _deal_row(stats, store_pair[0].chain_id, offer.store_id)
+        if row is None:
             continue
         median = round(row["median_cents"]) if row.get("median_cents") else None
         minimum = row.get("min_cents")
