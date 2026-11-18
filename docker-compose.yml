@@ -17,6 +17,8 @@ services:
   api:
     build: .
     restart: unless-stopped
+    # writes price-tag photos into the bind mount; keep them user-owned
+    user: "1000:1000"
     env_file: .env
     depends_on:
       db:

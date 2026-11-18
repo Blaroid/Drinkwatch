@@ -193,10 +193,18 @@ re-encoded through Pillow, which strips EXIF including GPS, resized to 1600px an
 stored as JPEG under `PHOTOS_DIR` as `YYYY/MM/<token>.jpg`; `GET /v1/photos/{token}`
 serves them. Uploads are capped at 8 MB and de-duplicated per device by SHA-256.
 
-**Storage location:** set `PHOTOS_HOST_DIR` in `.env` to the redmax backup disk
-mount (e.g. `PHOTOS_HOST_DIR=/mnt/redmax/drinkwatch-photos`) and recreate the api
-container. The container always sees it at `/srv/photos` (`PHOTOS_DIR`). Until
-redmax is mounted it falls back to `./photos` on powermax.
+**Storage location:** the redmax backup disk. Docker cannot bind-mount a user's
+sshfs mount (root cannot traverse it without `allow_other`, which needs sudo), so:
+
+1. `./photos` on powermax is the API's local cache (`PHOTOS_HOST_DIR=./photos`,
+   container path `/srv/photos`), written by the api container running as uid 1000.
+2. `~/.config/systemd/user/redmax-mount.service` sshfs-mounts
+   `redmax:/storage/backup1` at `~/mnt/redmax`.
+3. `drinkwatch-photos-sync.timer` runs `scripts/photos-sync.sh` every 10 minutes:
+   it copies new photos to `~/mnt/redmax/drinkwatch/photos` (canonical copy) and
+   prunes local files older than 14 days once they are on redmax.
+
+So the served copy is local, but nothing is lost if powermax dies.
 
 NFC e-ink shelf labels are **not readable** by a phone: retail ESLs (Solum,
 Hanshow, Pricer) use proprietary 2.4 GHz/IR/sub-GHz links and their NFC coils are
