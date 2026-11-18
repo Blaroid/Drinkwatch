@@ -143,11 +143,26 @@ and keep the retail-derived data unattributed to those retailers in the app UI
 Store locations come from OpenStreetMap (ODbL), geocoding from Nominatim -
 both need attribution in the app.
 
+## Android app
+
+The companion app lives in a separate repo (`~/drinkwatch-android`, also on the
+powermax build box): Kotlin + Compose, a Glance home-screen widget, barcode
+scanning, on-device price-tag OCR, basket/budget planners and alert notifications.
+
+    https://cans.hazzardous.online/app                 install page
+    https://cans.hazzardous.online/app/drinkwatch.apk  the APK itself
+    https://cans.hazzardous.online/app/version.json    versionCode/versionName/notes
+
+Publishing a build: copy the release APK to `~/drinkwatch/apk/drinkwatch.apk`,
+update `version.json`, and the API serves it (the `apk/` directory is bind-mounted
+read-only at `/srv/apk`). The app is signed with `~/drinkwatch-android/keystore/
+drinkwatch.jks` (backed up to redmax); keep that key or updates stop working.
+
 ## Next
 
-* Android app (Kotlin + Compose) with a Glance widget calling /v1/widget.
-* Barcode scanning for crowd submissions (/v1/products/barcode/{barcode}).
 * Product link curation pass: /v1/admin/products/suggestions.
+* Wear OS tile + complication (same /v1/widget payload).
+* Receipt scanning flow in the app (endpoint already exists).
 * IGA scraper once we know which Perth stores use igashop.
 
 ## Feature pack (barcodes, photos, plans, alerts)

@@ -145,6 +145,7 @@ class ObservationIn(BaseModel):
     in_stock: bool | None = None
     note: str | None = Field(default=None, max_length=300)
     photo_url: str | None = Field(default=None, max_length=500)
+    photo_token: str | None = Field(default=None, max_length=64)
     observed_at: datetime | None = None
 
 

@@ -188,6 +188,15 @@ def submit_observation(
         if litres > 0:
             unit_per_litre = round(payload.price_cents / litres)
 
+    photo_id = None
+    if payload.photo_token:
+        from ..models import Photo
+
+        photo = session.scalar(select(Photo).where(Photo.token == payload.photo_token))
+        if photo is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "unknown photo token")
+        photo_id = photo.id
+
     observation = Observation(
         store_id=store.id,
         chain_id=store.chain_id,
@@ -204,6 +213,7 @@ def submit_observation(
         device_id=device.id,
         note=payload.note,
         photo_url=payload.photo_url,
+        photo_id=photo_id,
         observed_at=observed_at,
         status="needs_review" if needs_review else "accepted",
     )

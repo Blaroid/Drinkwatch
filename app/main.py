@@ -12,7 +12,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles  # noqa: F401  (kept for future admin UI)
 
 from . import __version__
-from .api import admin, alerts, barcode, basket, crowd, photos, public
+from .api import admin, alerts, appdownload, barcode, basket, crowd, photos, public
 from .config import settings
 from .db import init_db, wait_for_db
 
@@ -65,6 +65,7 @@ app.include_router(alerts.router)
 app.include_router(photos.router)
 app.include_router(crowd.router)
 app.include_router(admin.router)
+app.include_router(appdownload.router)
 
 
 @app.get("/healthz", tags=["ops"])

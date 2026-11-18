@@ -30,6 +30,8 @@ services:
       - ./migrations:/srv/migrations:ro
       # price-tag photos: point PHOTOS_HOST_DIR at the redmax backup disk
       - ${PHOTOS_HOST_DIR:-./photos}:/srv/photos
+      # sideload APK served at /app/drinkwatch.apk
+      - ./apk:/srv/apk:ro
 
 volumes:
   pgdata:

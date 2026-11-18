@@ -28,6 +28,7 @@ class Settings:
     default_max_age_hours: int
     max_price_cents: int
     photos_dir: str
+    apk_dir: str
     photos_max_bytes: int
     off_lookup_enabled: bool
     fuelwatch_enabled: bool
@@ -65,6 +66,7 @@ class Settings:
             default_max_age_hours=int(os.environ.get("DEFAULT_MAX_AGE_HOURS", "72")),
             max_price_cents=int(os.environ.get("MAX_PRICE_CENTS", "50000")),
             photos_dir=os.environ.get("PHOTOS_DIR", "/srv/photos"),
+            apk_dir=os.environ.get("APK_DIR", "/srv/apk"),
             photos_max_bytes=int(os.environ.get("PHOTOS_MAX_BYTES", str(8 * 1024 * 1024))),
             off_lookup_enabled=_flag("OFF_LOOKUP_ENABLED", True),
             fuelwatch_enabled=_flag("FUELWATCH_ENABLED", True),

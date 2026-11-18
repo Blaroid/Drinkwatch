@@ -111,6 +111,7 @@ Submit a sighting:
       "in_stock": true,
       "note": "fridge by the door",
       "photo_url": null,
+      "photo_token": null,                     // from POST /v1/photos (preferred)
       "observed_at": "2026-11-18T06:07:52Z"    // optional, defaults to now
     }
     201 {"id": 21448, "status": "accepted", "confirms": 0, "disputes": 0, ...}
