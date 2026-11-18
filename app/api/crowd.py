@@ -26,9 +26,38 @@ from ..schemas import (
     VoteIn,
 )
 from ..security import current_device, hash_token, new_device_token, read_limiter, write_limiter
-from .deps import format_cents, utcnow
+from .deps import DISPUTE_LIMIT, EXEMPT_REPUTATION, confirm_weight, format_cents, utcnow
 
 router = APIRouter(prefix="/v1", tags=["crowd"])
+
+
+def _needs_review(price_cents: int, reference_cents: int | None, reputation: int) -> bool:
+    """Whether a sighting has to wait for a human/second confirm.
+
+    The outlier check is for new devices: a price far from the recent median is
+    exactly what a typo or a stale price looks like. A device at
+    EXEMPT_REPUTATION has had that many sightings accepted, so its track record
+    is the review and its rows go straight into the ledger.
+    """
+    if reputation >= EXEMPT_REPUTATION:
+        return False
+    if not reference_cents:
+        return False
+    ratio = price_cents / reference_cents
+    return ratio > 2.5 or ratio < 0.4
+
+
+def _status_after_votes(status: str, confirms: int, disputes: int) -> str:
+    """Recompute an observation's status from its vote tally.
+
+    `confirms` is already reputation-weighted (confirm_weight()); `disputes` is
+    a raw count, since one annoyed device should not outweigh the crowd.
+    """
+    if status == "needs_review" and confirms >= 2:
+        status = "accepted"
+    if disputes >= DISPUTE_LIMIT and status == "accepted":
+        status = "needs_review"
+    return status
 
 
 def _client_ip(request: Request) -> str:
@@ -177,10 +206,7 @@ def submit_observation(
         return _serialize(session, [recent])[0]
 
     reference = _reference_price(session, product)
-    needs_review = False
-    if reference:
-        ratio = payload.price_cents / reference
-        needs_review = ratio > 2.5 or ratio < 0.4
+    needs_review = _needs_review(payload.price_cents, reference, device.reputation or 0)
 
     unit_per_litre = None
     if product.size_ml and product.pack_count:
@@ -247,20 +273,25 @@ def vote(
         existing.vote = payload.vote
         existing.created_at = utcnow()
 
-    confirms, disputes = session.execute(
-        select(func.count())
-        .select_from(ObservationVote)
-        .where(ObservationVote.observation_id == observation.id, ObservationVote.vote == 1)
-    ).one()[0], session.execute(
-        select(func.count())
-        .select_from(ObservationVote)
-        .where(ObservationVote.observation_id == observation.id, ObservationVote.vote == -1)
-    ).one()[0]
+    # App sessions are built with autoflush=False, so without this the vote
+    # just cast is still pending and the tally below (and the status it
+    # decides) is always one vote behind: the confirm that should clear the
+    # queue needs a later vote to be seen at all.
+    session.flush()
 
-    if observation.status == "needs_review" and int(confirms or 0) >= 2:
-        observation.status = "accepted"
-    if int(disputes or 0) >= 3 and observation.status == "accepted":
-        observation.status = "needs_review"
+    confirms, disputes = 0, 0
+    for vote_value, reputation in session.execute(
+        select(ObservationVote.vote, Device.reputation)
+        .select_from(ObservationVote)
+        .join(Device, Device.id == ObservationVote.device_id)
+        .where(ObservationVote.observation_id == observation.id)
+    ):
+        if vote_value > 0:
+            confirms += confirm_weight(reputation)
+        else:
+            disputes += 1
+
+    observation.status = _status_after_votes(observation.status, confirms, disputes)
     session.commit()
     return _serialize(session, [observation])[0]
 
