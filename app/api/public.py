@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import bindparam, func, select, text
+from sqlalchemy import and_, bindparam, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from .. import __version__
@@ -206,16 +207,46 @@ def products(
     session: Session = Depends(get_session),
 ) -> list[ProductOut]:
     stmt = select(Product).where(Product.is_active.is_(True))
-    if q:
-        needle = f"%{q.lower()}%"
-        stmt = stmt.where(
-            func.lower(Product.brand + " " + Product.name + " " + func.coalesce(Product.variant, "")).like(needle)
+    order = [Product.brand, Product.name, Product.pack_count]
+    if q and q.strip():
+        term = q.strip().lower()
+        # "energy drink" is part of every energy product's meaning even though the
+        # word is stripped from the name, so typing it still has to work.
+        blob = func.lower(
+            Product.brand
+            + " "
+            + Product.name
+            + " "
+            + func.coalesce(Product.variant, "")
+            + " energy drink "
+            + func.coalesce(func.cast(Product.size_ml, __import__("sqlalchemy").String), "")
+            + " "
+            + func.coalesce(func.cast(Product.size_ml, __import__("sqlalchemy").String), "")
+            + "ml"
         )
+        conditions = []
+        for token in [part for part in term.split() if part]:
+            # word-boundary hit (so "v" finds V, not Violet) or a fuzzy near-miss
+            pattern = "\\m" + re.escape(token) + "\\M"
+            conditions.append(
+                or_(
+                    blob.op("~")(pattern),
+                    func.word_similarity(token, blob) > 0.40,
+                )
+            )
+        stmt = stmt.where(and_(*conditions))
+        order = [
+            func.greatest(
+                func.similarity(blob, term), func.word_similarity(term, blob)
+            ).desc(),
+            Product.brand,
+            Product.name,
+        ]
     if brand:
         stmt = stmt.where(func.lower(Product.brand) == brand.lower())
     if category:
         stmt = stmt.where(Product.category == category)
-    stmt = stmt.order_by(Product.brand, Product.name, Product.pack_count).offset(offset).limit(limit)
+    stmt = stmt.order_by(*order).offset(offset).limit(limit)
     return [ProductOut.model_validate(p) for p in session.scalars(stmt)]
 
 
