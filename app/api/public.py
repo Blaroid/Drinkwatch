@@ -313,6 +313,7 @@ def widget(
     products: str | None = Query(default=None, description="comma separated slugs (max 8)"),
     radius_km: float | None = Query(default=None, gt=0),
     max_age_hours: int | None = Query(default=None, ge=1, le=720),
+    suggest: int = Query(default=0, ge=0, le=8, description="append this many similar drinks"),
     session: Session = Depends(get_session),
 ) -> WidgetOut:
     radius = clamp_radius(radius_km)
@@ -372,6 +373,52 @@ def widget(
                 age_hours=best.age_hours,
             )
         )
+
+    # "that's the end of your list" suggestions: same brand first, then whatever
+    # else nearby has fresh prices.
+    if suggest > 0 and items:
+        wanted = {product.id for product in catalogue}
+        wanted_brands = {product.brand.lower() for product in catalogue}
+        candidates = list(
+            session.scalars(
+                select(Product)
+                .where(
+                    Product.is_active.is_(True),
+                    Product.category == "energy",
+                    Product.status != "rejected",
+                    ~Product.id.in_(wanted),
+                )
+                .order_by(Product.brand, Product.name)
+                .limit(60)
+            )
+        )
+        ranked = []
+        for candidate in candidates:
+            offers = _offers_for_product(session, candidate, stores, since)
+            if not offers:
+                continue
+            same_brand = 0 if candidate.brand.lower() in wanted_brands else 1
+            ranked.append((same_brand, offers[0].price_cents, candidate, offers[0]))
+        ranked.sort(key=lambda row: (row[0], row[1]))
+        for _, _, candidate, best in ranked[:suggest]:
+            items.append(
+                WidgetItemOut(
+                    slug=candidate.slug,
+                    label=_label(candidate),
+                    price_cents=best.price_cents,
+                    price=best.price,
+                    per_can_cents=best.per_can_cents,
+                    store=best.store_name,
+                    chain=best.chain_code,
+                    suburb=best.suburb,
+                    distance_km=best.distance_km,
+                    promo=best.promo_kind,
+                    source=best.source,
+                    age_hours=best.age_hours,
+                    suggested=True,
+                )
+            )
+
     return WidgetOut(generated_at=utcnow(), radius_km=radius, items=items)
 
 

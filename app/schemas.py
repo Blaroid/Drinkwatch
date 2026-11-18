@@ -99,6 +99,7 @@ class WidgetItemOut(BaseModel):
     promo: str
     source: str
     age_hours: float
+    suggested: bool = False
 
 
 class WidgetOut(BaseModel):
