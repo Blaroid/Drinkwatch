@@ -114,7 +114,7 @@ Submit a sighting:
       "photo_token": null,                     // from POST /v1/photos (preferred)
       "observed_at": "2026-11-18T06:07:52Z"    // optional, defaults to now
     }
-    201 {"id": 21448, "status": "accepted", "confirms": 0, "disputes": 0, ...}
+    201 {"id": 21448, "status": "accepted", "confirms": 0, "disputes": 0, "sightings": 1, ...}
 
 Rules the API enforces: price 1c..$500, `observed_at` within the last 30 days and
 not in the future, multibuy needs `promo_qty`. Repeat submissions of the same
@@ -122,6 +122,13 @@ price by the same device at the same store within 12h return the existing row
 (201, same id) instead of duplicating. A price more than 2.5x (or under 0.4x) the
 recent median comes back with `status: "needs_review"` until two other users
 confirm it.
+
+`sightings` is how many reports back that exact price at that store within the
+hour before it. Different devices reporting the same price are the same fact, so
+`GET /v1/observations` folds them into the newest report and says
+`"sightings": 5` rather than showing five identical rows; the write response
+carries the full tally too. Each report is still stored, so the count is the
+crowd agreeing with itself rather than a repeated click by one device.
 
 Confirm or dispute someone else's sighting:
 
