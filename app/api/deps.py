@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
+from typing import Mapping, TypeVar
 
 from fastapi import HTTPException, status
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
 
 from ..models import Observation, Product, Store
+
+_ChainRow = TypeVar("_ChainRow")
 
 
 def utcnow() -> datetime:
@@ -77,17 +80,17 @@ _STORE_SCOPE_SQL = text(
 
 _CHAIN_SCOPE_SQL = text(
     """
-    select distinct on (o.chain_id)
+    select distinct on (o.chain_id, o.state)
            o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.state, o.observed_at
     from observations o
     where o.chain_id in :chain_ids
       and o.product_id in :product_ids
       and o.store_id is null
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.chain_id, o.observed_at desc, o.id desc
+    order by o.chain_id, o.state, o.observed_at desc, o.id desc
     """
 ).bindparams(bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True))
 
@@ -111,21 +114,35 @@ _BULK_STORE_SQL = text(
 
 _BULK_CHAIN_SQL = text(
     """
-    select distinct on (o.chain_id, o.product_id)
+    select distinct on (o.chain_id, o.product_id, o.state)
            o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.state, o.observed_at
     from observations o
     where o.chain_id in :chain_ids
       and o.product_id in :product_ids
       and o.store_id is null
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.chain_id, o.product_id, o.observed_at desc, o.id desc
+    order by o.chain_id, o.product_id, o.state, o.observed_at desc, o.id desc
     """
 ).bindparams(
     bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True)
 )
+
+
+def chain_row_for(
+    chain_rows: Mapping[tuple, _ChainRow], *key: int, state: str | None
+) -> _ChainRow | None:
+    """The chain-scope price that applies to a store, from rows keyed ``(*key, state)``.
+
+    A row scoped to the store's own state wins. A null-state row comes from a
+    scrape that could not pin a store, and is matched to every store of the chain
+    -- the pre-state behaviour. There is deliberately no fallback from "no WA row"
+    to "another state's row": an out-of-state price must not reach a Perth store.
+    """
+    row = chain_rows.get((*key, state))
+    return row if row is not None else chain_rows.get((*key, None))
 
 
 def bulk_latest_prices(
@@ -154,13 +171,15 @@ def bulk_latest_prices(
         _BULK_CHAIN_SQL,
         {"chain_ids": chain_ids, "product_ids": product_ids, "since": since},
     ).mappings()
-    chain_prices = {(row["chain_id"], row["product_id"]): dict(row) for row in chain_rows}
+    chain_prices = {
+        (row["chain_id"], row["product_id"], row["state"]): dict(row) for row in chain_rows
+    }
     for store in stores:
         for product_id in product_ids:
             key = (store.id, product_id)
             if key in found:
                 continue
-            row = chain_prices.get((store.chain_id, product_id))
+            row = chain_row_for(chain_prices, store.chain_id, product_id, state=store.state)
             if row is not None:
                 found[key] = {**row, "store_id": store.id, "price_scope": "chain"}
     return found
@@ -193,11 +212,15 @@ def latest_prices(
             _CHAIN_SCOPE_SQL,
             {"chain_ids": sorted(missing_chains), "product_ids": product_ids, "since": since},
         ).mappings()
-        chain_prices = {row["chain_id"]: Observation(**dict(row)) for row in chain_rows}
+        chain_prices = {
+            (row["chain_id"], row["state"]): Observation(**dict(row)) for row in chain_rows
+        }
         for store in stores:
-            if store.id in by_store or store.chain_id not in chain_prices:
+            if store.id in by_store:
                 continue
-            chain_row = chain_prices[store.chain_id]
+            chain_row = chain_row_for(chain_prices, store.chain_id, state=store.state)
+            if chain_row is None:
+                continue
             by_store[store.id] = Observation(
                 id=chain_row.id,
                 store_id=store.id,
@@ -212,6 +235,7 @@ def latest_prices(
                 in_stock=chain_row.in_stock,
                 source=chain_row.source,
                 price_scope="chain",
+                state=chain_row.state,
                 observed_at=chain_row.observed_at,
             )
     return by_store

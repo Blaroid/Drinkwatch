@@ -168,6 +168,9 @@ class Observation(Base):
     source: Mapped[str] = mapped_column(String(10))
     # store = price specific to this store, chain = chain-wide online price
     price_scope: Mapped[str] = mapped_column(String(10), default="store")
+    # state a chain-scope price applies to (Woolworths/Coles publish per state);
+    # null means "not state-specific" and is matched to every store of the chain
+    state: Mapped[str | None] = mapped_column(String(8))
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id", ondelete="SET NULL"))
     note: Mapped[str | None] = mapped_column(String(300))
     photo_url: Mapped[str | None] = mapped_column(String(500))
