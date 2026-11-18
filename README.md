@@ -1,300 +1,200 @@
 # DrinkWatch
 
-Energy drink prices near you, from supermarket websites plus crowd sightings.
-Backend for the Android app and its home-screen widget.
+Energy drink prices near you, in Perth, Western Australia.
 
-Public API: https://cans.hazzardous.online (docs at /docs, OpenAPI at /openapi.json)
+The supermarket sites publish prices; nobody publishes petrol-station or IGA
+prices, so those come from people using the app. This repo is the backend: the
+scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
+
+* **API + docs:** https://cans.hazzardous.online/docs
+* **Android app:** https://cans.hazzardous.online/app (sideload, ~15 MB)
+* **App source:** https://github.com/Blaroid/drinkwatch-android
 
 ## What it does
 
-* Keeps a directory of Perth stores (Woolworths, Coles, SpudShed, IGA, 7-Eleven,
-  Vibe, Ampol, BP) with coordinates.
-* Scrapes the chains that publish prices: **SpudShed** per store (each store is
-  its own subdomain with its own prices), **Woolworths** and **Coles** at chain
-  level (they publish one online price per state, not per store).
-* Accepts **crowd price sightings** from app users - this is the only way to get
-  petrol-station and IGA prices, and it overrides scraped prices when fresher.
-* Serves a tiny JSON payload shaped for an Android widget.
+* Keeps a directory of ~550 Perth stores (Woolworths, Coles, SpudShed, IGA,
+  7-Eleven, Vibe, Ampol, BP) with coordinates, from OpenStreetMap.
+* Scrapes the chains that publish prices, and stores one price ledger that both
+  sources write into.
+* Accepts **crowd sightings** from the app: price, photo of the tag, scanned
+  barcode, and (for unknown cans) the name off the label.
+* Serves small, cached JSON for the phone widget.
+* Answers the questions that need maths: *which store is cheapest for this list*,
+  *what is the best use of $20 if I only care about caffeine*, *is the drive worth
+  it once fuel is counted*.
 
-## Data reality check
+## Data sources, honestly
 
-| Source | Prices | Notes |
+| Source | Prices | How |
 |---|---|---|
-| SpudShed | real, per store | 7 online stores x 2 categories, plain HTML |
-| Woolworths | real, per state | JSON API behind an Akamai cookie checkpoint |
+| SpudShed | real, per store | 7 online stores, each its own subdomain, plain HTML |
+| Woolworths | real, per state | JSON search API behind an Akamai cookie checkpoint |
 | Coles | real, per state | Next.js data route; Akamai bot-walls the IP after bursts, so it is best effort |
-| IGA | none | stores are independently owned; only some have online shops. Crowd only for now |
+| IGA | none | independently owned; only some stores have online shops. Crowd only |
 | 7-Eleven / Vibe / Ampol / BP | none published anywhere | crowd only, by design |
 
-`price_scope` on every price tells you which it is: `store` means the price is
-specific to that shop, `chain` means it is the chain's online price attributed to
-every store of that chain.
+Every price row carries `price_scope`:
+
+* `store` - the price belongs to that shop (SpudShed, crowd reports)
+* `chain` - the chain's online price, attributed to every store of that chain at
+  query time. The app labels these "online".
 
 ## Architecture
 
-    scrapers (spudshed / woolworths / coles)        crowd (Android app)
+    scrapers (spudshed / woolworths / coles)        Android app (crowd)
             |                                              |
             v                                              v
-      +--------------------------------------------------------+
-      |  FastAPI  (docker, 127.0.0.1:8788)                     |
-      |    /v1/...  read API, crowd API, admin API             |
-      |    APScheduler: spudshed every 6h, woolworths + coles  |
-      |                 daily at 05:20 / 05:45 Perth           |
-      +--------------------------------------------------------+
-            |                              |
-            v                              v
-      PostgreSQL 17                 cloudflared tunnel
-      (docker volume)               cans.hazzardous.online
+      +----------------------------------------------------------+
+      |  FastAPI  127.0.0.1:8788  (docker)                        |
+      |    /v1/...            read API, crowd API, admin API      |
+      |    APScheduler        spudshed 6h, ww 05:20, coles 05:45  |
+      |                       alerts every 30 min                 |
+      +----------------------------------------------------------+
+            |                                    |
+            v                                    v
+      PostgreSQL 17                      cloudflared tunnel
+      (docker volume)                    cans.hazzardous.online
 
-## Layout
+Price maths lives in `app/pricing.py` and is pure: bundle extraction (single /
+pack / multibuy), integer coin change for "cheapest way to buy N cans", and an
+exact unbounded knapsack for "most caffeine for $X".
 
-    app/
-      main.py            FastAPI app, lifespan, middleware
-      config.py          env-driven settings
-      db.py              engine, sessions, schema bootstrap
-      models.py          SQLAlchemy models (the schema of record)
-      schemas.py         request/response models
-      security.py        device tokens, admin token, rate limiting
-      api/public.py      read endpoints (stores, products, prices, widget)
-      api/crowd.py       device registration, sightings, votes, reports
-      api/admin.py       scraping control, product curation, moderation
-      scrape/base.py     polite HTTP clients (httpx + curl_cffi), idempotent writes
-      scrape/normalize.py product name parsing and matching
-      scrape/spudshed.py / woolworths.py / coles.py / iga.py
-      scrape/runner.py   CLI runner + global scrape lock
-      scheduler.py       APScheduler jobs
-    scripts/
-      seed.py            chains + Perth stores from OpenStreetMap
-      seed_spudshed.py   SpudShed stores from their own store chooser
-      geocode_stores.py  suburb names for stores that OSM left bare
-      migrate.py         applies migrations/*.sql
-      cleanup.py         purges scraper noise after rule changes
-      smoke.py           end-to-end checks against a running API
-    migrations/          SQL migrations, applied in filename order
+## Quick start
 
-## Running it
+Requires Docker.
 
-On powermax (already deployed):
-
-    cd ~/drinkwatch
-    docker compose up -d --build     # api + postgres
-    docker compose logs -f api
-    curl -s localhost:8788/v1/meta
-
-First-time bootstrap:
-
+    cp .env.example .env          # set ADMIN_TOKEN
+    docker compose up -d --build
     docker compose exec -T api python scripts/migrate.py
     docker compose exec -T api python scripts/seed.py            # chains + OSM stores
     docker compose exec -T api python scripts/seed_spudshed.py   # SpudShed subdomains
     docker compose exec -T api python scripts/geocode_stores.py  # suburb names
     docker compose exec -T api python -m app.scrape.runner --all
 
-Ongoing:
+Then:
 
-    docker compose exec -T api python -m app.scrape.runner --chain spudshed
-    docker compose exec -T api python -m app.scrape.runner --list
+    curl -s localhost:8788/v1/meta
+    curl -s "localhost:8788/v1/widget?lat=-31.9523&lon=115.8613&radius_km=15" | jq
 
-The scheduler inside the API container handles the daily runs, so manual runs are
-only for testing.
+## API in one screen
+
+Full reference: [API.md](API.md). Interactive: `/docs`.
+
+    GET  /v1/widget?lat&lon&radius_km&products&suggest    phone widget payload
+    GET  /v1/prices?product&lat&lon&radius_km             every store's price + deal badge
+    GET  /v1/products?q=monstr                            typo-tolerant search
+    GET  /v1/stores/search?q=spud&lat&lon                 store picker
+    GET  /v1/barcode/{code}                               EAN-13 / GTIN-14 / UPC-A / retailer codes
+    POST /v1/products/pending                             unknown can -> review queue
+    POST /v1/photos                                       price-tag photo (EXIF stripped)
+    POST /v1/observations                                 crowd price (dedupe + outlier check)
+    POST /v1/basket/compare                               price a shopping list per store
+    GET  /v1/value/max-caffeine?budget_cents&mode         knapsack plan
+    GET  /v1/plan/route?items=slug:qty,...                multi-store plan + FuelWatch fuel cost
+    POST /v1/alerts                                       "tell me when it drops"
+    GET  /v1/caffeine/today                               daily gauge
+    POST /v1/admin/scrape/run                             trigger a scrape (X-Admin-Token)
+
+## Project layout
+
+    app/
+      main.py              FastAPI app, lifespan, middleware
+      config.py            env-driven settings
+      db.py                engine, sessions, schema bootstrap
+      models.py            SQLAlchemy models - the schema of record
+      schemas.py           request/response models
+      security.py          device tokens, admin token, rate limiting
+      pricing.py           bundle / coin-change / knapsack maths (pure)
+      notify.py            price alert evaluation -> notifications
+      scheduler.py         APScheduler jobs
+      api/                 public, crowd, admin, photos, barcode, basket, alerts, appdownload
+      scrape/              spudshed, woolworths, coles, iga, fuelwatch, normalize, runner
+    scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke
+    migrations/            SQL migrations, applied in filename order
+    docs/                  screenshots
 
 ## Configuration
 
-.env (see .env.example):
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | postgres in compose | Postgres DSN |
+| `PUBLIC_BASE_URL` | http://127.0.0.1:8788 | links in API responses |
+| `ADMIN_TOKEN` | - | required for `/v1/admin/*` |
+| `SCRAPE_ENABLED` | true | master switch for scrapers |
+| `SCRAPE_USER_AGENT` | DrinkWatch/0.1 | honest bot UA for seeding/geocoding |
+| `SCRAPE_BROWSER_UA` | Chrome 131 | Woolworths/Coles entry pages |
+| `SCHEDULER_ENABLED` | true | in-process APScheduler |
+| `PHOTOS_DIR` / `PHOTOS_HOST_DIR` | /srv/photos, ./photos | photo cache |
+| `OFF_LOOKUP_ENABLED` | true | Open Food Facts suggestion fallback |
+| `FUELWATCH_ENABLED` | true | FuelWatch WA RSS for ULP prices |
+| `VEHICLE_L_PER_100KM` | 8.5 | fuel estimate for route plans |
+| `MAX_BUDGET_CENTS` | 20000 | cap for the budget optimiser |
+| `DAILY_CAFFEINE_LIMIT_MG` | 400 | guideline used by the gauge |
 
-    DATABASE_URL=postgresql+psycopg://drinkwatch:drinkwatch@db:5432/drinkwatch
-    PUBLIC_BASE_URL=https://cans.hazzardous.online
-    ADMIN_TOKEN=<secret>          # required for /v1/admin/*
-    SCRAPE_ENABLED=true
-    SCRAPE_USER_AGENT=DrinkWatch/0.1 (contact: ...)
-    SCRAPE_BROWSER_UA=...         # used for Woolworths/Coles entry pages
-    SCHEDULER_ENABLED=true
-    CORS_ORIGINS=*
-    DEFAULT_RADIUS_KM=15
-    MAX_RADIUS_KM=100
-    DEFAULT_MAX_AGE_HOURS=72
+## Operations
 
-## Schema notes
+* **Migrations** - `docker compose exec -T api python scripts/migrate.py`. Applied
+  files are tracked in `schema_migrations`.
+* **Scrapes** - scheduled in-process; manual runs via
+  `python -m app.scrape.runner --chain spudshed` (`--list` shows what is enabled).
+* **Photos** - the api container writes `./photos` as uid 1000; a systemd user
+  timer mirrors them to the redmax backup disk every 10 minutes and prunes local
+  copies after 14 days (`scripts/photos-sync.sh`).
+* **Backups** - data lives in the `drinkwatch_pgdata` volume:
+  `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz`
+* **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
+  exercises 30 read/crowd/plan paths. It writes real rows; clean them with the SQL
+  in the script header.
 
-* `products` is one row per brand + flavour + size + pack. Retailer spellings
-  that we cannot safely merge are kept as separate rows and linked by hand with
-  `products.canonical_product_id` (see /v1/admin/products/suggestions).
-* `observations` is the price ledger: append-only, one row per sighting.
-  `store_id` is NULL for chain-wide online prices.
-* Prices are integers in cents everywhere (`price_cents`). Never floats.
-* `dedupe_key` makes scraper writes idempotent per day and per price change.
+## Data model notes
 
-## Ops
+* `products` is one row per brand + flavour + size + pack. Names are the flavour
+  only, with "Original" for the plain variant; the app composes
+  "Monster Ultra Zero 500ml x4" from brand + name + size.
+* Retailer spellings of the same can are linked with `products.canonical_product_id`
+  (curated: `/v1/admin/products/suggestions` proposes pairs, `/products/{slug}/link`
+  confirms). Prices are merged across a group at query time.
+* `barcodes` maps *every* code form (EAN-13, GTIN-14, UPC-A, retailer-internal
+  codes) to a product, because Woolworths' 14-digit codes do not survive naive
+  normalisation.
+* `observations` is the append-only price ledger. `store_id` is NULL for
+  chain-wide online prices. A `dedupe_key` makes scraper writes idempotent.
+* `price_daily` keeps one row per (day, chain, product) so deal badges still have
+  history when a price does not change for weeks.
 
-Tunnel: `systemctl --user status drinkwatch-tunnel` (config in
-`~/.config/drinkwatch/tunnel.yml`, logs via `journalctl --user -u drinkwatch-tunnel`).
+## Versioning
 
-Backups: the data lives in the `drinkwatch_pgdata` docker volume.
+`app/__init__.py` holds `__version__`, surfaced at `GET /v1/meta`. Every behavioural
+change bumps it and lands as one commit:
 
-    docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz
+    0.1.0  launch: scrapers, crowd API, widget
+    0.1.1  clean product names ("Original" fallback)
+    0.2.0  typo-tolerant product search (pg_trgm)
+    0.3.1  /v1/widget?suggest for "end of your list" suggestions
+    docs   README / API.md only, no version bump
 
-## Legal / etiquette
+## Legal and etiquette
 
 Scraping Woolworths and Coles violates their terms of service. This runs at
-roughly 20 requests per day, cached in the database, with an honest rate limit,
-for personal/friends-scale use. Do not turn this into a commercial price feed,
-and keep the retail-derived data unattributed to those retailers in the app UI
-(show "online price" for `price_scope=chain`).
+roughly 20 requests a day, cached, rate-limited, for personal and friends-scale
+use. Do not turn it into a commercial price feed.
 
-Store locations come from OpenStreetMap (ODbL), geocoding from Nominatim -
-both need attribution in the app.
+Attribution required in any UI built on this: store locations from
+**OpenStreetMap** (ODbL), geocoding from **Nominatim**, fuel prices from
+**FuelWatch WA**.
 
-## Android app
+## If this ever covers more than drinks
 
-The companion app lives in a separate repo (`~/drinkwatch-android`, also on the
-powermax build box): Kotlin + Compose, a Glance home-screen widget, barcode
-scanning, on-device price-tag OCR, basket/budget planners and alert notifications.
+The model is built around canned drinks. These are the load-bearing assumptions,
+and what would need to change for snacks, coffee or anything sold by weight.
 
-    https://cans.hazzardous.online/app                 install page
-    https://cans.hazzardous.online/app/drinkwatch.apk  the APK itself
-    https://cans.hazzardous.online/app/version.json    versionCode/versionName/notes
-
-Publishing a build: copy the release APK to `~/drinkwatch/apk/drinkwatch.apk`,
-update `version.json`, and the API serves it (the `apk/` directory is bind-mounted
-read-only at `/srv/apk`). The app is signed with `~/drinkwatch-android/keystore/
-drinkwatch.jks` (backed up to redmax); keep that key or updates stop working.
-
-## Next
-
-* Product link curation pass: /v1/admin/products/suggestions.
-* Wear OS tile + complication (same /v1/widget payload).
-* Receipt scanning flow in the app (endpoint already exists).
-* IGA scraper once we know which Perth stores use igashop.
-
-## Feature pack (barcodes, photos, plans, alerts)
-
-### Scanning and onboarding
-
-`GET /v1/barcode/{barcode}` resolves through a `barcodes` index rather than one
-"canonical" column, because the same can arrives as EAN-13, GTIN-14 (Woolworths
-prefixes a packaging `1`), UPC-A (leading zero) and, occasionally, a retailer's own
-code that is not a valid GTIN at all (`11220000063348`). Every observed form maps
-to a product, so any of them resolves. `checksum_ok` in the response tells the app
-whether the code is a real EAN/GTIN (some Woolworths codes are not) - resolve it
-anyway, but do not trust it as identity.
-
-Unknown code -> `POST /v1/products/pending` with the name and size printed on the
-can. That creates a `status='pending'` product (plus an optional price row) and
-notifies nobody; an admin confirms with `/v1/admin/products/{slug}/approve`, which
-can also set `caffeine_mg_per_100ml` or merge into an existing product.
-
-Open Food Facts is only a *suggestion*: Australian energy drinks are almost absent
-(7 of 8 real AU barcodes tested 404), and its entries for junk barcodes are
-user-invented. Never auto-create from OFF.
-
-### Photos
-
-`POST /v1/photos` (multipart `file`) takes price-tag / shelf shots. Images are
-re-encoded through Pillow, which strips EXIF including GPS, resized to 1600px and
-stored as JPEG under `PHOTOS_DIR` as `YYYY/MM/<token>.jpg`; `GET /v1/photos/{token}`
-serves them. Uploads are capped at 8 MB and de-duplicated per device by SHA-256.
-
-**Storage location:** the redmax backup disk. Docker cannot bind-mount a user's
-sshfs mount (root cannot traverse it without `allow_other`, which needs sudo), so:
-
-1. `./photos` on powermax is the API's local cache (`PHOTOS_HOST_DIR=./photos`,
-   container path `/srv/photos`), written by the api container running as uid 1000.
-2. `~/.config/systemd/user/redmax-mount.service` sshfs-mounts
-   `redmax:/storage/backup1` at `~/mnt/redmax`.
-3. `drinkwatch-photos-sync.timer` runs `scripts/photos-sync.sh` every 10 minutes:
-   it copies new photos to `~/mnt/redmax/drinkwatch/photos` (canonical copy) and
-   prunes local files older than 14 days once they are on redmax.
-
-So the served copy is local, but nothing is lost if powermax dies.
-
-NFC e-ink shelf labels are **not readable** by a phone: retail ESLs (Solum,
-Hanshow, Pricer) use proprietary 2.4 GHz/IR/sub-GHz links and their NFC coils are
-for commissioning, with vendor-encrypted payloads. Price capture is camera-based
-(OCR on device) plus QR codes where a store prints them; any NDEF payload the app
-does encounter should be logged as experimental data rather than trusted.
-
-### Plans
-
-* `POST /v1/basket/compare` - price a shopping list at each nearby store, using
-  whichever pack size / multibuy is cheapest for the requested quantity (integer
-  coin-change per store, so "4 singles vs a 4-pack vs 2 x 2-pack deal" is solved,
-  not guessed). Also returns a multi-store plan.
-* `GET /v1/value/max-caffeine?budget_cents=&mode=single_store|multi_store` - an
-  exact unbounded knapsack over bundles (max mg subject to budget). Because AU
-  formulated caffeinated beverages are capped at 32 mg/100 mL, this ranks by
-  millilitres per dollar in practice; the API says so in `note` and flags
-  `exceeds_daily_limit` against a 400 mg/day guideline.
-* `GET /v1/plan/route?items=slug:qty,...` - one store per item, nearest-neighbour
-  stop order, distance, and a **fuel cost estimate from the FuelWatch WA RSS feed**
-  (open government data, ULP per suburb) using `VEHICLE_L_PER_100KM`. It also
-  returns the cheapest single-store baseline so the app can say "not worth the
-  drive".
-
-### Alerts, notifications, caffeine
-
-`POST /v1/alerts` stores a threshold (per product, family, chain or store).
-`app/notify.py` evaluates them after every scrape and every 30 minutes, writing
-`notifications` rows that the app polls with `GET /v1/notifications` (one alert
-fires at most once per 24 h). Push delivery needs your own Firebase project
-credentials - the payload is already shaped for an FCM data message.
-
-`POST /v1/caffeine` + `GET /v1/caffeine/today` keep a per-device caffeine log
-against the 400 mg/day guideline.
-
-### Badges and history
-
-`price_daily` holds one row per (day, chain, product) because `observations`
-dedupes unchanged prices and would otherwise record no history. `/v1/prices`
-offers carry `stats: {median_90d_cents, min_90d_cents, deal}` where `deal` is
-`great|good|typical|high`. It needs a few days of rows before it says anything
-useful; below three samples per chain the field is `null` on purpose.
-
-### Home Assistant
-
-`scripts/ha_bridge.py` publishes each tracked drink's cheapest price to MQTT with
-Home Assistant discovery, so entities appear automatically and can drive
-automations ("notify when Monster 4-pack < $8"). See the file docstring for env
-vars (`MQTT_HOST`, `MQTT_USER`, `MQTT_PASS`, `DW_PRODUCTS`, `DW_LAT`, `DW_LON`).
-
-### Wear OS / Android Auto
-
-Wear OS: a Tile plus a complication, both fed by the same `/v1/widget` payload,
-pushed from the phone over the Data Layer API. Platform refresh limits are
-minutes, which is fine for daily prices.
-
-Android Auto: not possible for this app category. The Car App Library accepts
-navigation, POI, IOT, messaging, calling, weather, media and parked
-(video/games/browsers) apps only - a price lookup fits none, so car-app review
-would reject it. The useful in-car move is a "navigate to cheapest store" intent
-into Google Maps.
-
-## Design choices that would need revisiting for other product categories
-
-Everything is modelled around canned drinks. If this expands to snacks, coffee
-bags, or anything sold by weight, these are the load-bearing assumptions:
-
-1. **`products.size_ml` and `pack_count`** are the only size model. Snacks need
-   grams/pieces and a unit basis (`unit_kind` + `unit_size`), and every
-   `per_litre_cents` / `caffeine_mg_for` / bundle calculation becomes
-   category-specific. `caffeine_mg_per_100ml` is meaningless outside drinks;
-   it should become a generic `per_100_units` nutrient block.
-2. **`family_slug`** is built as `brand + flavour + size` and strips a `-xN`
-   suffix. Snacks have flavours *and* formats (multipack, share pack, single
-   serve) and often no size at all, so family grouping needs category rules.
-3. **`scrape/*` keyword lists and the `is_energy_item` guard** are energy-drink
-   specific (brand allowlists, `\benergy\b` heuristics). Each new category needs
-   its own brand allowlist plus a category-scoped URL (spudshed `/category/...`,
-   Woolworths/Coles search terms), and the product-matching thresholds were tuned
-   on can names.
-4. **Caffeine/`max-caffeine`** is an energy-drink endpoint. A generic version
-   would be "max <nutrient> per dollar" with the nutrient as a parameter, and the
-   FSANZ 32 mg/100 mL default becomes one of several defaults.
-5. **`price_scope`** and the chain-vs-store split hold for any grocery item, but
-   "is this a good deal" percentiles assume frequent repricing. Perishables and
-   long-cycle goods need different windows (`price_daily` history).
-6. **UI copy and defaults**: the widget's default catalogue is "8 most observed
-   energy drinks, max 2 per brand". Multi-category needs per-category default
-   lists and a "what do you actually buy" profile.
-7. **`daily_caffeine_limit_mg`** is a health assumption for drinks only; a snack
-   or iced-coffee expansion needs per-category guidance (sugar, kJ, serving size).
-8. **Barcode index** stays valid, but snacks often have no GTIN (deli, produce) -
-   those need a "no barcode" submission path keyed on photo + name + price/kg.
+1. `size_ml` + `pack_count` are the only size model - snacks need unit basis
+   (grams/pieces) and a per-category unit price.
+2. `caffeine_mg_per_100ml` should become a generic nutrient block.
+3. `family_slug` (brand + flavour + size, `-xN` stripped) assumes drink naming.
+4. `scrape/*` keyword lists and `is_energy_item` are energy-drink specific.
+5. The budget optimiser is "max caffeine per dollar"; a generic version takes the
+   nutrient as a parameter.
+6. `price_daily` percentiles assume frequent repricing.
+7. The widget's default catalogue is "8 most stocked energy drinks, max 2/brand".
+8. Barcode-first onboarding assumes a GTIN; deli/produce needs a photo+name+price/kg path.
