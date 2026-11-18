@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+import statistics
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_session
-from ..models import Device, Observation, ObservationVote, Product, Store
+from ..models import Chain, Device, Observation, ObservationVote, Product, Store
 from ..schemas import (
     BatchObservationIn,
     BatchObservationResult,
@@ -105,20 +107,105 @@ def _serialize(session: Session, observations: list[Observation]) -> list[Observ
     return out
 
 
-def _reference_price(session: Session, product: Product) -> int | None:
-    """Median of the last few accepted prices for this product, any store."""
-    rows = list(
-        session.scalars(
-            select(Observation.price_cents)
-            .where(Observation.product_id == product.id, Observation.status == "accepted")
-            .order_by(Observation.observed_at.desc())
-            .limit(9)
+# How a crowd price is judged before it is allowed to influence everyone else.
+#
+# These are triage thresholds, not a verdict: a flagged sighting is only held
+# for two human votes, so a false positive costs a reviewer a glance while a
+# false negative quietly corrupts a store's price. The cuts below are chosen to
+# sit well outside normal retail variation but inside obvious data errors.
+#
+# * "Far out" is a modified z-score of 3.5. That is the conventional
+#   Iglewicz-Hoaglin cut-off for small samples, and it stays meaningful when the
+#   population is only a handful of rows (a plain sigma cut-off is not).
+# * The scale floor matters more than the z: supermarket chains price a can at
+#   one level right across a city, so the median absolute deviation is often
+#   exactly 0 and the score would divide by zero. Treating 12% of the median as
+#   the smallest believable spread means a fixed-price chain behaves like a
+#   roughly 1.65x / 0.35x band around its own median -- tighter than the old
+#   fixed 2.5x / 0.4x, and still loose enough to let half-price and clearance
+#   sightings through.
+# * Four comparable prices is the minimum that can be called a population;
+#   below that we simply do not flag rather than guess.
+OUTLIER_Z = 3.5
+OUTLIER_MAD_FLOOR = 0.12
+REFERENCE_MIN_SAMPLES = 4
+# Enough rows for a stable median, few enough that prices from a year of promos
+# do not drag the middle away from what the chain charges now.
+REFERENCE_SAMPLE_LIMIT = 30
+REFERENCE_WINDOW = timedelta(days=180)
+
+
+@dataclass(frozen=True)
+class _Reference:
+    """The population a submitted price is judged against, in cents."""
+
+    median_cents: float
+    scale_cents: float
+    samples: int
+
+    def is_outlier(self, price_cents: int) -> bool:
+        # 0.6745 turns the MAD into a standard-deviation equivalent for a normal
+        # distribution, which is what gives OUTLIER_Z its usual meaning.
+        return 0.6745 * abs(price_cents - self.median_cents) / self.scale_cents > OUTLIER_Z
+
+
+def _recent_prices(
+    session: Session,
+    product_id: int,
+    chain_filter: ColumnElement[bool],
+    device_id: int | None,
+    since: datetime,
+) -> list[int]:
+    """Recent accepted prices for one product from one comparable population."""
+    stmt = (
+        select(Observation.price_cents)
+        .where(
+            Observation.product_id == product_id,
+            Observation.status == "accepted",
+            Observation.observed_at >= since,
+            chain_filter,
         )
+        .order_by(Observation.observed_at.desc(), Observation.id.desc())
+        .limit(REFERENCE_SAMPLE_LIMIT)
     )
-    if not rows:
+    if device_id is not None:
+        # A reporter must not set their own yardstick: without this a device can
+        # walk a bad series up (or down) and have every step look normal, and one
+        # device's repeated typo becomes the reference for everyone else.
+        stmt = stmt.where(Observation.device_id.is_distinct_from(device_id))
+    return list(session.scalars(stmt))
+
+
+def _reference_price(
+    session: Session, product: Product, store: Store, device_id: int | None
+) -> _Reference | None:
+    """Build the population this sighting should be judged against.
+
+    Prices are not comparable across retail formats: a 7-Eleven can is not
+    "expensive" beside a Coles can, it is a different market. So the reference is
+    the same chain, widened to chains of the same kind (supermarket / convenience
+    / servo) only when this chain has too little history of its own. Both price
+    scopes stay in the population because a chain-wide online price is still that
+    chain's price for the product; it is the *store* attribution that differs.
+    """
+    since = utcnow() - REFERENCE_WINDOW
+    prices = _recent_prices(
+        session, product.id, Observation.chain_id == store.chain_id, device_id, since
+    )
+    if len(prices) < REFERENCE_MIN_SAMPLES:
+        same_kind_chains = select(Chain.id).where(Chain.kind == store.chain.kind)
+        prices = _recent_prices(
+            session, product.id, Observation.chain_id.in_(same_kind_chains), device_id, since
+        )
+    if len(prices) < REFERENCE_MIN_SAMPLES:
         return None
-    rows.sort()
-    return rows[len(rows) // 2]
+    median = float(statistics.median(prices))
+    mad = float(statistics.median([abs(price - median) for price in prices]))
+    return _Reference(
+        median_cents=median,
+        scale_cents=max(mad, OUTLIER_MAD_FLOOR * median),
+        samples=len(prices),
+    )
 
 
 @router.post("/observations", response_model=ObservationOut, status_code=status.HTTP_201_CREATED)
@@ -176,11 +263,8 @@ def submit_observation(
     if recent is not None:
         return _serialize(session, [recent])[0]
 
-    reference = _reference_price(session, product)
-    needs_review = False
-    if reference:
-        ratio = payload.price_cents / reference
-        needs_review = ratio > 2.5 or ratio < 0.4
+    reference = _reference_price(session, product, store, device.id)
+    needs_review = reference is not None and reference.is_outlier(payload.price_cents)
 
     unit_per_litre = None
     if product.size_ml and product.pack_count:
