@@ -62,6 +62,22 @@ def create_alert(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "give a product_slug or a family_slug"
         )
+    if payload.max_price_cents is None and payload.min_drop_percent is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "give a max_price_cents or a min_drop_percent",
+        )
+    location_fields = (payload.lat, payload.lon, payload.radius_km)
+    if sum(field is None for field in location_fields) not in (0, len(location_fields)):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "give lat, lon and radius_km together, or none of them",
+        )
+    if payload.radius_km is not None and payload.radius_km > settings.max_radius_km:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"radius_km must be at most {settings.max_radius_km:g} km",
+        )
 
     product = None
     if payload.product_slug:
@@ -75,10 +91,14 @@ def create_alert(
         select(PriceAlert).where(
             PriceAlert.device_id == device.id,
             PriceAlert.max_price_cents == payload.max_price_cents,
+            PriceAlert.min_drop_percent == payload.min_drop_percent,
             PriceAlert.product_id == (product.id if product else None),
             PriceAlert.family_slug == (payload.family_slug or (product.family_slug if product else None)),
             PriceAlert.chain_code == payload.chain_code,
             PriceAlert.store_id == payload.store_id,
+            PriceAlert.lat == payload.lat,
+            PriceAlert.lon == payload.lon,
+            PriceAlert.radius_km == payload.radius_km,
             PriceAlert.is_active.is_(True),
         )
     )
@@ -92,6 +112,10 @@ def create_alert(
         chain_code=payload.chain_code,
         store_id=payload.store_id,
         max_price_cents=payload.max_price_cents,
+        min_drop_percent=payload.min_drop_percent,
+        lat=payload.lat,
+        lon=payload.lon,
+        radius_km=payload.radius_km,
     )
     session.add(alert)
     session.commit()

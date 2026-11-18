@@ -243,6 +243,8 @@ returns 422.
 
     POST   /v1/alerts      {"product_slug": "monster-ultra-500ml", "max_price_cents": 800,
                             "chain_code": null, "store_id": null}      (device auth)
+           optional triggers and filters: {"min_drop_percent": 15,
+                            "lat": -31.9523, "lon": 115.8613, "radius_km": 10}
     GET    /v1/alerts                                                    (device auth)
     DELETE /v1/alerts/{id}                                               (device auth, deactivates)
     GET    /v1/notifications?unread_only=true&limit=50                   (device auth)
@@ -256,6 +258,13 @@ returns 422.
 
 Alerts fire at most once per 24 h per alert. Delivery is pull-based until you add
 FCM credentials; the notification `payload` is already FCM-shaped.
+
+There are two triggers and either is enough: `max_price_cents` (an absolute
+ceiling) and `min_drop_percent` (a fall of at least that many percent below the
+product's 30-day median in that chain). `lat`/`lon`/`radius_km` — all three or
+none — limit evaluation to stores within that radius; without them an alert
+scans every active store, as it always did. `chain_code` and `store_id` narrow
+the scan further and still work alongside the radius.
 
 ## Batch and receipts
 
