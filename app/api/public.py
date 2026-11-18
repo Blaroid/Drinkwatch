@@ -247,15 +247,25 @@ def widget(
             .group_by(Observation.product_id)
             .subquery()
         )
-        catalogue = list(
+        ranked = list(
             session.scalars(
                 select(Product)
                 .join(popularity, popularity.c.product_id == Product.id)
                 .where(Product.is_active.is_(True), Product.category == "energy")
                 .order_by(popularity.c.hits.desc(), Product.brand, Product.name)
-                .limit(8)
+                .limit(60)
             )
         )
+        # Spread the default rows across brands instead of 8 Monster flavours.
+        catalogue = []
+        seen: dict[str, int] = {}
+        for candidate in ranked:
+            if seen.get(candidate.brand, 0) >= 2:
+                continue
+            seen[candidate.brand] = seen.get(candidate.brand, 0) + 1
+            catalogue.append(candidate)
+            if len(catalogue) == 8:
+                break
 
     stores = nearby_stores(session, lat, lon, radius, limit=200)
     items: list[WidgetItemOut] = []
