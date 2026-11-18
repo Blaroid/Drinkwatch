@@ -96,7 +96,7 @@ _CHAIN_SCOPE_SQL = text(
 _BULK_STORE_SQL = text(
     """
     select distinct on (o.store_id, o.product_id)
-           o.store_id, o.product_id, o.price_cents, o.was_price_cents,
+           o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
            o.in_stock, o.source, o.price_scope, o.observed_at
     from observations o
@@ -113,7 +113,7 @@ _BULK_STORE_SQL = text(
 _BULK_CHAIN_SQL = text(
     """
     select distinct on (o.chain_id, o.product_id)
-           o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
+           o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
            o.in_stock, o.source, o.price_scope, o.observed_at
     from observations o
@@ -129,41 +129,76 @@ _BULK_CHAIN_SQL = text(
 )
 
 
+def _observation_dict(row: Observation) -> dict:
+    """The plain-dict view of a row that bulk_latest_prices() returns.
+
+    pricing.collect_offers() and notify.evaluate_alerts() index these dicts, so
+    the shape is public API even though it is only built here. `id`/`chain_id`
+    are deliberately not included: they were never part of this shape and no
+    caller wants them.
+    """
+    return {
+        "store_id": row.store_id,
+        "product_id": row.product_id,
+        "price_cents": row.price_cents,
+        "was_price_cents": row.was_price_cents,
+        "unit_price_cents_per_l": row.unit_price_cents_per_l,
+        "promo_kind": row.promo_kind,
+        "promo_qty": row.promo_qty,
+        "promo_total_cents": row.promo_total_cents,
+        "in_stock": row.in_stock,
+        "source": row.source,
+        "price_scope": row.price_scope,
+        "observed_at": row.observed_at,
+    }
+
+
 def bulk_latest_prices(
     session: Session,
     stores: list[Store],
     product_ids: list[int],
     since: datetime,
 ) -> dict[tuple[int, int], dict]:
-    """Latest accepted price for every (store, product) pair in two queries.
+    """Freshest accepted price for every (store, product) pair in two queries.
 
-    Store-specific sightings win; chain-wide online prices are attributed to each
-    store of that chain, same rule as latest_prices().
+    Both candidate rows are always fetched — the store's own sightings and the
+    chain-wide online price attributed to every store in that chain — and the
+    more recently observed one wins, via the same `_freshest()` rule
+    `latest_prices()` uses. A stale store row therefore cannot shadow last
+    night's scrape for the planner (pricing.collect_offers) or an alert
+    (notify.evaluate_alerts). Ties go to the store-scoped row.
+
+    Values keep the historical dict shape rather than a StorePrice pair: the
+    losing row has no consumer on this path, so only the winner is returned.
     """
     if not stores or not product_ids:
         return {}
     store_ids = [store.id for store in stores]
     chain_ids = sorted({store.chain_id for store in stores})
-    rows = session.execute(
-        _BULK_STORE_SQL,
-        {"store_ids": store_ids, "product_ids": product_ids, "since": since},
-    ).mappings()
-    found: dict[tuple[int, int], dict] = {
-        (row["store_id"], row["product_id"]): dict(row) for row in rows
+    store_rows = {
+        (row["store_id"], row["product_id"]): Observation(**dict(row))
+        for row in session.execute(
+            _BULK_STORE_SQL,
+            {"store_ids": store_ids, "product_ids": product_ids, "since": since},
+        ).mappings()
     }
-    chain_rows = session.execute(
-        _BULK_CHAIN_SQL,
-        {"chain_ids": chain_ids, "product_ids": product_ids, "since": since},
-    ).mappings()
-    chain_prices = {(row["chain_id"], row["product_id"]): dict(row) for row in chain_rows}
+    chain_rows = {
+        (row["chain_id"], row["product_id"]): Observation(**dict(row))
+        for row in session.execute(
+            _BULK_CHAIN_SQL,
+            {"chain_ids": chain_ids, "product_ids": product_ids, "since": since},
+        ).mappings()
+    }
+    found: dict[tuple[int, int], dict] = {}
     for store in stores:
         for product_id in product_ids:
-            key = (store.id, product_id)
-            if key in found:
-                continue
-            row = chain_prices.get((store.chain_id, product_id))
-            if row is not None:
-                found[key] = {**row, "store_id": store.id, "price_scope": "chain"}
+            chosen = _freshest(
+                store_rows.get((store.id, product_id)),
+                chain_rows.get((store.chain_id, product_id)),
+                store.id,
+            )
+            if chosen is not None:
+                found[(store.id, product_id)] = _observation_dict(chosen.primary)
     return found
 
 
