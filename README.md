@@ -16,8 +16,10 @@ scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
   7-Eleven, Vibe, Ampol, BP) with coordinates, from OpenStreetMap.
 * Scrapes the chains that publish prices, and stores one price ledger that both
   sources write into.
-* Accepts **crowd sightings** from the app: price, photo of the tag, scanned
-  barcode, and (for unknown cans) the name off the label.
+* Resolves **scanned barcodes** for Woolworths and Coles cans: both chains
+  publish the printed GTIN on their product pages. Accepts **crowd sightings**
+  from the app for everything else: price, photo of the tag, scanned barcode,
+  and (for unknown cans) the name off the label.
 * Serves small JSON for the phone widget.
 * Answers the questions that need maths: *which store is cheapest for this list*,
   *what is the best use of $20 if I only care about caffeine*, *is the drive worth
@@ -108,8 +110,8 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
       notify.py            price alert evaluation -> notifications
       scheduler.py         APScheduler jobs
       api/                 public, crowd, admin, photos, barcode, basket, alerts, appdownload
-      scrape/              spudshed, woolworths, coles, iga, fuelwatch, normalize, runner
-    scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke
+      scrape/              spudshed, woolworths, coles, iga, gtin, normalize, runner
+    scripts/               seed, migrate, backfill, backfill_barcodes, barcode_report, clean_names, photos-sync, smoke
     migrations/            SQL migrations, applied in filename order
     docs/                  screenshots
 
@@ -126,6 +128,7 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 | `SCHEDULER_ENABLED` | true | in-process APScheduler |
 | `PHOTOS_DIR` / `PHOTOS_HOST_DIR` | /srv/photos, ./photos | photo cache |
 | `OFF_LOOKUP_ENABLED` | true | Open Food Facts suggestion fallback |
+| `BARCODE_LOOKUP_LIMIT` | 8 | product-detail GTIN lookups per scraped chain per run |
 | `FUELWATCH_ENABLED` | true | FuelWatch WA RSS for ULP prices |
 | `VEHICLE_L_PER_100KM` | 8.5 | fuel estimate for route plans |
 | `MAX_BUDGET_CENTS` | 20000 | cap for the budget optimiser |
@@ -136,9 +139,22 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 The barcode index was purged on 2026-11-19 (the seeded codes were a mix of
 GTIN-14 retailer strings, internal codes and test rows). `barcodes`,
 `products.barcode`/`normalised_barcode` and `listings.barcode` were cleared;
-a dump of the old table is in `backups/barcodes-*.sql`. New codes arrive from
-crowd scans (`POST /v1/products/pending`) and from the next scrape of a chain
-that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
+a dump of the old table is in `backups/barcodes-*.sql`.
+
+New codes are read from the product-detail pages of the two chains that publish
+a GTIN: Woolworths' `/apis/ui/product/detail/<stockcode>` (`Product.Barcode`)
+and Coles' `/product/<id>` page (`gtin` in both the JSON-LD and the Next.js
+`pageProps`). Their search payloads carry `Barcode: null` on every tile, and
+SpudShed publishes no GTIN at all, so SpudShed/IGA/petrol-station cans stay
+crowd-only. Scrapes discover a few codes per run (`BARCODE_LOOKUP_LIMIT`); to
+fill the existing backlog, and to measure the gap:
+
+    python scripts/backfill_barcodes.py             # dry run, rate-limited
+    python scripts/backfill_barcodes.py --apply
+    python scripts/barcode_report.py
+
+`scripts/backfill.py` still re-indexes every code already stored on a product or
+listing.
 
 ## Operations
 
@@ -172,7 +188,9 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   confirms). Prices are merged across a group at query time.
 * `barcodes` maps *every* code form (EAN-13, GTIN-14, UPC-A, retailer-internal
   codes) to a product, because Woolworths' 14-digit codes do not survive naive
-  normalisation.
+  normalisation. The scrapers fill it from the chains' product-detail pages;
+  `barcode_cache` remembers a per-SKU lookup miss so a code-less product is not
+  re-fetched every day.
 * `observations` is the append-only price ledger. `store_id` is NULL for
   chain-wide online prices. A `dedupe_key` makes scraper writes idempotent.
 * `price_daily` keeps one row per (day, chain, product, store) so deal badges still

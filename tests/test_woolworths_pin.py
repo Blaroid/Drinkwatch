@@ -45,6 +45,8 @@ def _fake_settings(
         woolworths_store_id=store_id,
         woolworths_settlement=settlement,
         woolworths_state=state,
+        # These tests pin store/state wiring, not barcode discovery.
+        barcode_lookup_limit=0,
     )
 
 
@@ -69,13 +71,19 @@ def wired(monkeypatch):
         recorded.append(kwargs)
         return True
 
-    product = types.SimpleNamespace(id=3, size_ml=500, pack_count=1)
+    product = types.SimpleNamespace(
+        id=3, size_ml=500, pack_count=1, barcode=None, normalised_barcode=None
+    )
     monkeypatch.setattr(woolworths, "HttpClient", _Http)
     monkeypatch.setattr(
         woolworths, "chain_by_code", lambda session, code: types.SimpleNamespace(id=7)
     )
     monkeypatch.setattr(woolworths, "match_product_woolworths", lambda *a, **k: (product, False))
-    monkeypatch.setattr(woolworths, "_upsert_listing", lambda *a, **k: types.SimpleNamespace(id=11))
+    monkeypatch.setattr(
+        woolworths,
+        "_upsert_listing",
+        lambda *a, **k: types.SimpleNamespace(id=11, barcode=None, external_sku="123"),
+    )
     monkeypatch.setattr(woolworths, "record_price", _record_price)
     client.product = {
         "DisplayName": "Monster Energy 500ml",

@@ -36,6 +36,10 @@ class Settings:
     apk_dir: str
     photos_max_bytes: int
     off_lookup_enabled: bool
+    # Product-detail pages are the only place the supermarkets publish a GTIN,
+    # so barcode discovery costs one extra request per uncoded SKU. Cap it per
+    # scrape run; the backlog script can be run deliberately.
+    barcode_lookup_limit: int
     fuelwatch_enabled: bool
     vehicle_l_per_100km: float
     fuel_price_cents_per_l: int
@@ -78,6 +82,7 @@ class Settings:
             apk_dir=os.environ.get("APK_DIR", "/srv/apk"),
             photos_max_bytes=int(os.environ.get("PHOTOS_MAX_BYTES", str(8 * 1024 * 1024))),
             off_lookup_enabled=_flag("OFF_LOOKUP_ENABLED", True),
+            barcode_lookup_limit=max(0, int(os.environ.get("BARCODE_LOOKUP_LIMIT", "8"))),
             fuelwatch_enabled=_flag("FUELWATCH_ENABLED", True),
             vehicle_l_per_100km=float(os.environ.get("VEHICLE_L_PER_100KM", "8.5")),
             fuel_price_cents_per_l=int(os.environ.get("FUEL_PRICE_CENTS_PER_L", "180")),

@@ -27,6 +27,7 @@ class ScrapeStats:
     observations_written: int = 0
     products_created: int = 0
     listings_seen: int = 0
+    barcodes_found: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -36,6 +37,7 @@ class ScrapeStats:
             "observations_written": self.observations_written,
             "products_created": self.products_created,
             "listings_seen": self.listings_seen,
+            "barcodes_found": self.barcodes_found,
             "errors": self.errors[:20],
         }
 

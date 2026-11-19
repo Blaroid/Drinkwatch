@@ -15,14 +15,17 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..models import Listing, Product
 from .base import CffiClient, ScrapeStats, chain_by_code, record_price
+from .gtin import coles_page_has_product, enrich_listing, parse_coles_product
 from .normalize import is_energy_item, match_product, parse_pack
 
 log = logging.getLogger(__name__)
 
 CHAIN_CODE = "coles"
 BASE_URL = "https://www.coles.com.au"
+PRODUCT_URL = BASE_URL + "/product/{sku}"
 BUILD_ID_RE = re.compile(r'"buildId"\s*:\s*"([^"]+)"')
 BOT_WALL_RE = re.compile(r"Pardon Our Interruption|ewelcome-|Reference #", re.I)
 BUILD_ID_CACHE = pathlib.Path("/tmp/coles_build_id")
@@ -85,6 +88,26 @@ def search(client: CffiClient, bid: str, term: str, page: int = 1) -> list[dict]
     return payload.get("pageProps", {}).get("searchResults", {}).get("results", []) or []
 
 
+def fetch_barcode(client: CffiClient, sku: str) -> str | None:
+    """Read the GTIN from the product page the app links to.
+
+    Coles' search results carry no barcode/GTIN field at all. The product page
+    does, in both its schema.org JSON-LD and the Next.js pageProps, so a page
+    fetch per uncoded SKU is the only route. A bot wall must raise rather than
+    look like "this product has no code", or the memo would hide it for a month.
+    """
+    response = client.get(
+        PRODUCT_URL.format(sku=sku),
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": BASE_URL + "/search/products",
+        },
+    )
+    if not coles_page_has_product(response.text):
+        raise RuntimeError("coles product page did not contain a product (bot wall?)")
+    return parse_coles_product(response.text)
+
+
 def _upsert_listing(session: Session, chain_id: int, raw: dict, product: Product, pack_count: int) -> Listing:
     sku = str(raw.get("id"))
     listing = session.scalar(
@@ -114,6 +137,7 @@ def scrape(
     if chain is None:
         stats.errors.append("chain 'coles' not seeded")
         return stats
+    barcode_budget = settings.barcode_lookup_limit
     with CffiClient(min_interval=1.5) as client:
         try:
             bid = resolve_build_id(client)
@@ -157,6 +181,22 @@ def scrape(
                 if product is None:
                     continue
                 listing = _upsert_listing(session, chain.id, raw, product, pack_count)
+                had_barcode = bool(listing.barcode)
+                try:
+                    code, barcode_budget = enrich_listing(
+                        session,
+                        listing,
+                        product,
+                        chain=CHAIN_CODE,
+                        source="coles-detail",
+                        budget=barcode_budget,
+                        fetch=lambda sku: fetch_barcode(client, sku),
+                    )
+                except Exception as exc:  # network: retry next run, do not memoise
+                    log.warning("coles barcode %s: %s", listing.external_sku, exc)
+                else:
+                    if code and not had_barcode:
+                        stats.barcodes_found += 1
 
                 promo_kind = "none"
                 promo_qty = None
