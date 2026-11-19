@@ -19,16 +19,22 @@ alter table price_alerts
 alter table price_alerts alter column max_price_cents drop not null;
 
 -- An alert with neither trigger could never fire; one with either is fine.
+--
+-- Postgres has no ADD CONSTRAINT IF NOT EXISTS, so drop first: a replay of this
+-- file on a database that already ran it must not fail on "already exists".
+alter table price_alerts drop constraint if exists ck_alert_trigger;
 alter table price_alerts
     add constraint ck_alert_trigger
     check (max_price_cents is not null or min_drop_percent is not null);
 
+alter table price_alerts drop constraint if exists ck_alert_drop_percent;
 alter table price_alerts
     add constraint ck_alert_drop_percent
     check (min_drop_percent is null or min_drop_percent between 1 and 90);
 
 -- A radius we cannot evaluate (no centre) or half a location pair is a bug, not
 -- a preference: reject it at write time rather than silently scanning everything.
+alter table price_alerts drop constraint if exists ck_alert_location;
 alter table price_alerts
     add constraint ck_alert_location
     check (

@@ -372,11 +372,12 @@ class PriceDaily(Base):
     """One row per (day, chain, product, store): the history behind deal badges.
 
     ``store_id`` is NULL for the chain-level row (and for chains that only publish
-    a chain-wide price), so the real key is a NULLS NOT DISTINCT unique index from
-    migration 008: Postgres cannot put a nullable column in a primary key. The
-    primary_key flags below only give the ORM an identity - nothing loads
-    PriceDaily objects - and reproduce what create_all builds before migrations
-    run, which is what migration 006's backfill infers its conflict target from.
+    a chain-wide price), so the real key is the NULLS NOT DISTINCT unique index
+    migration 012 installs: Postgres cannot put a nullable column in a primary
+    key. Declaring those columns primary_key here would make create_all build a
+    table with a 3-column key that the migrations then drop, so the table has no
+    primary key at all and ``__mapper_args__`` supplies the ORM identity instead
+    (nothing loads PriceDaily objects).
     """
 
     __tablename__ = "price_daily"
@@ -392,15 +393,13 @@ class PriceDaily(Base):
         ),
     )
 
-    day: Mapped[datetime] = mapped_column(Date, primary_key=True)
-    chain_id: Mapped[int] = mapped_column(
-        ForeignKey("chains.id", ondelete="CASCADE"), primary_key=True
-    )
-    product_id: Mapped[int] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"), primary_key=True
-    )
+    day: Mapped[datetime] = mapped_column(Date)
+    chain_id: Mapped[int] = mapped_column(ForeignKey("chains.id", ondelete="CASCADE"))
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"))
     price_cents: Mapped[int] = mapped_column(Integer)
     was_price_cents: Mapped[int | None] = mapped_column(Integer)
     promo_kind: Mapped[str] = mapped_column(String(16), default="none")
     source: Mapped[str] = mapped_column(String(10), default="scrape")
+
+    __mapper_args__ = {"primary_key": [day, chain_id, product_id]}
