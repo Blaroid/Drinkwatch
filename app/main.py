@@ -15,6 +15,7 @@ from . import __version__
 from .api import admin, alerts, appdownload, barcode, basket, crowd, photos, public
 from .config import settings
 from .db import init_db, wait_for_db
+from .security import ReadRateLimitMiddleware, read_limiter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,11 +31,17 @@ async def lifespan(app: FastAPI):
     log.info("schema ready")
 
     scheduler = None
-    if settings.scheduler_enabled and settings.scrape_enabled:
+    # The scheduler owns the alert and digest timers as well as the scrapers, so
+    # only the scraping jobs follow SCRAPE_ENABLED. Stopping scrapes must not
+    # stop alerts on crowd prices (audit #34 item 14).
+    if settings.scheduler_enabled:
         from .scheduler import start_scheduler
 
-        scheduler = start_scheduler()
-        log.info("scrape scheduler started")
+        scheduler = start_scheduler(settings.scrape_enabled)
+        log.info(
+            "scheduler started (scrape jobs %s)",
+            "enabled" if settings.scrape_enabled else "disabled",
+        )
 
     yield
 
@@ -56,6 +63,13 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+)
+# Added last so it is the outermost layer: reads are counted (and unauthenticated
+# floods refused) before any other middleware or router work happens.
+app.add_middleware(
+    ReadRateLimitMiddleware,
+    limiter=read_limiter,
+    trusted_proxy_hops=settings.trusted_proxy_hops,
 )
 
 app.include_router(public.router)

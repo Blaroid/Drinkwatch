@@ -12,7 +12,18 @@ from sqlalchemy.orm import Session
 from ..caffeine import apply_reference_caffeine
 from ..daily import sync_daily_price
 from ..db import get_session
-from ..models import Chain, Device, Listing, Observation, Product, Report, ScrapeRun, Store
+from ..models import (
+    Barcode,
+    Chain,
+    Device,
+    Listing,
+    Observation,
+    Photo,
+    Product,
+    Report,
+    ScrapeRun,
+    Store,
+)
 from ..security import require_admin
 from .deps import utcnow
 
@@ -54,17 +65,21 @@ def stats(session: Session = Depends(get_session)) -> dict:
     def count(table) -> int:
         return int(session.scalar(select(func.count()).select_from(table)) or 0)
 
+    # Stores and observations are counted in their own subqueries. Joining both
+    # onto Chain in one query multiplies each observation by the number of stores
+    # in the chain, which read as ~30x too many rows on the live database.
     per_chain = session.execute(
         select(
             Chain.code,
-            func.count(func.distinct(Store.id)).label("stores"),
-            func.count(Observation.id).label("observations"),
-        )
-        .select_from(Chain)
-        .outerjoin(Store, Store.chain_id == Chain.id)
-        .outerjoin(Observation, Observation.chain_id == Chain.id)
-        .group_by(Chain.code)
-        .order_by(Chain.code)
+            select(func.count(Store.id))
+            .where(Store.chain_id == Chain.id)
+            .scalar_subquery()
+            .label("stores"),
+            select(func.count(Observation.id))
+            .where(Observation.chain_id == Chain.id)
+            .scalar_subquery()
+            .label("observations"),
+        ).order_by(Chain.code)
     ).all()
     per_source = session.execute(
         select(Observation.source, func.count()).group_by(Observation.source)
@@ -191,6 +206,196 @@ def map_listing(
     listing.product_id = product.id
     session.commit()
     return {"listing_id": listing.id, "product_id": product.id, "product_slug": product.slug}
+
+
+def _code_forms(raw: str) -> list[str]:
+    """Every key one physical code can occupy in the barcodes index.
+
+    deps.find_product_by_barcode() accepts whichever form a client scanned, so
+    a moderator acting on one form has to see the code's other forms too.
+    """
+    from ..scrape.normalize import barcode_variants
+
+    return barcode_variants(raw) or [raw]
+
+
+def _release_product_code(product: Product | None, forms: list[str]) -> list[str]:
+    """Clear a product's own barcode columns when they name one of ``forms``.
+
+    products.barcode and products.normalised_barcode resolve a scan on their
+    own, so a binding removed from the index would keep working through them.
+    """
+    if product is None:
+        return []
+    released = []
+    if product.barcode in forms:
+        product.barcode = None
+        released.append("barcode")
+    if product.normalised_barcode in forms:
+        product.normalised_barcode = None
+        released.append("normalised_barcode")
+    return released
+
+
+def _other_claimants(session: Session, product_id: int, forms: list[str]) -> list[Product]:
+    """Products whose own barcode columns resolve one of ``forms``.
+
+    Both products.barcode and products.normalised_barcode win a scan without the
+    barcodes table, so a moderator acting on a code has to account for them too.
+    """
+    return list(
+        session.scalars(
+            select(Product).where(
+                Product.id != product_id,
+                (Product.barcode.in_(forms)) | (Product.normalised_barcode.in_(forms)),
+            )
+        )
+    )
+
+
+def _claim_product_code(session: Session, product: Product, raw: str) -> bool:
+    """Make a mapped code the product's own code when nobody else claims it.
+
+    Writing the columns while another product still resolves the same code would
+    leave a scan with two answers, so the index rows alone carry the mapping
+    until the conflict is resolved.
+    """
+    from ..scrape.normalize import normalize_barcode
+
+    forms = _code_forms(raw)
+    if _other_claimants(session, product.id, forms):
+        return False
+    changed = False
+    normalised = normalize_barcode(raw)
+    if normalised and not product.normalised_barcode:
+        product.normalised_barcode = normalised
+        changed = True
+    if not product.barcode:
+        product.barcode = raw
+        changed = True
+    return changed
+
+
+class BarcodeMapRequest(BaseModel):
+    product_slug: str = Field(max_length=160)
+
+
+@router.get("/barcodes", summary="Barcode index rows, newest first")
+def barcodes(
+    product_slug: str | None = None,
+    source: str | None = Query(default=None, description="scrape | crowd | admin"),
+    barcode: str | None = Query(default=None, description="any form of one physical code"),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    stmt = (
+        select(Barcode, Product)
+        .join(Product, Product.id == Barcode.product_id)
+        .order_by(Barcode.created_at.desc(), Barcode.barcode)
+        .limit(limit)
+    )
+    if product_slug:
+        stmt = stmt.where(Product.slug == product_slug)
+    if source:
+        stmt = stmt.where(Barcode.source == source)
+    if barcode:
+        stmt = stmt.where(Barcode.barcode.in_(_code_forms(barcode)))
+    return [
+        {
+            "barcode": row.barcode,
+            "product_id": product.id,
+            "product_slug": product.slug,
+            "product_label": f"{product.brand} {product.name}".strip(),
+            "product_status": product.status,
+            "source": row.source,
+            "created_at": row.created_at,
+        }
+        for row, product in session.execute(stmt)
+    ]
+
+
+@router.delete("/barcodes/{barcode}", summary="Remove a barcode binding")
+def delete_barcode(barcode: str, session: Session = Depends(get_session)) -> dict:
+    """Unbind a code so scanning it stops resolving to that product.
+
+    Every form of the code goes, because the lookup accepts whichever form the
+    client scanned: deleting one row while a sibling form survived would leave
+    the binding working. A form bound to a different product is reported and
+    left for its own decision.
+    """
+    forms = _code_forms(barcode)
+    rows = list(session.scalars(select(Barcode).where(Barcode.barcode.in_(forms))))
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown barcode")
+    target = next(
+        (row.product_id for row in rows if row.barcode == barcode), rows[0].product_id
+    )
+    removed = [row.barcode for row in rows if row.product_id == target]
+    product = session.get(Product, target)
+    released = _release_product_code(product, forms)
+    others = {row.barcode: row.product_id for row in rows if row.product_id != target}
+    # A product that carries the code in its own columns keeps resolving a scan
+    # after the index row is gone, so report it rather than leaving the moderator
+    # believing the binding is dead.
+    for holder in _other_claimants(session, target, forms):
+        for form in (holder.barcode, holder.normalised_barcode):
+            if form in forms:
+                others.setdefault(form, holder.id)
+    for row in rows:
+        if row.product_id == target:
+            session.delete(row)
+    session.commit()
+    return {
+        "barcode": barcode,
+        "removed": removed,
+        "product_slug": product.slug if product is not None else None,
+        "product_columns_cleared": released,
+        "other_products": others,
+    }
+
+
+@router.post("/barcodes/{barcode}/map", summary="Bind or move a barcode onto a product")
+def map_barcode(
+    barcode: str, payload: BarcodeMapRequest, session: Session = Depends(get_session)
+) -> dict:
+    """Point a code at a product, creating the binding if it is new.
+
+    This is the repair path for a crowd binding that landed on the wrong can, and
+    the way to add a retailer-internal code that the crowd flow refuses.
+    """
+    product = session.scalar(select(Product).where(Product.slug == payload.product_slug))
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown product")
+    forms = _code_forms(barcode)
+    # A scan resolves through the index rows and through products.barcode /
+    # normalised_barcode alike, so a move has to take the code away from every
+    # product that currently answers it - including one that only carries it in
+    # its own columns, which no barcode row would have revealed.
+    holders = set(session.scalars(select(Barcode.product_id).where(Barcode.barcode.in_(forms))))
+    holders |= {holder.id for holder in _other_claimants(session, product.id, forms)}
+    holders.discard(product.id)
+    for holder_id in sorted(holders):
+        _release_product_code(session.get(Product, holder_id), forms)
+    created: list[str] = []
+    moved: list[str] = []
+    for form in forms:
+        row = session.get(Barcode, form)
+        if row is None:
+            session.add(Barcode(barcode=form, product_id=product.id, source="admin"))
+            created.append(form)
+        elif row.product_id != product.id:
+            row.product_id = product.id
+            moved.append(form)
+    columns = _claim_product_code(session, product, barcode)
+    session.commit()
+    return {
+        "barcode": barcode,
+        "product_id": product.id,
+        "product_slug": product.slug,
+        "created": created,
+        "moved": moved,
+        "product_columns_written": columns,
+    }
 
 
 @router.get("/products/links", summary="Current cross-chain product groups")
@@ -382,14 +587,48 @@ def devices(limit: int = Query(default=100, ge=1, le=500), session: Session = De
 def pending_products(
     limit: int = Query(default=100, ge=1, le=500), session: Session = Depends(get_session)
 ) -> list[dict]:
+    """The product queue, with the crowd sightings a decision has to judge.
+
+    A moderator cannot decide from a name and a count: the price, the store, the
+    device and the tag photo are the evidence. Returning them with the product
+    keeps ``scripts/review.py queue`` to one round trip per list.
+    """
+    products = list(
+        session.scalars(
+            select(Product)
+            .where(Product.status == "pending")
+            .order_by(Product.id.desc())
+            .limit(limit)
+        )
+    )
+    if not products:
+        return []
+
+    sightings: dict[int, list[dict]] = {product.id: [] for product in products}
     rows = session.execute(
-        select(Product, func.count(Observation.id))
-        .outerjoin(Observation, Observation.product_id == Product.id)
-        .where(Product.status == "pending")
-        .group_by(Product.id)
-        .order_by(Product.id.desc())
-        .limit(limit)
+        select(Observation, Store.name, Store.suburb, Photo.token)
+        .outerjoin(Store, Store.id == Observation.store_id)
+        .outerjoin(Photo, Photo.id == Observation.photo_id)
+        .where(Observation.product_id.in_(list(sightings)))
+        .order_by(Observation.observed_at.desc(), Observation.id.desc())
     ).all()
+    for observation, store_name, suburb, photo_token in rows:
+        sightings[observation.product_id].append(
+            {
+                "id": observation.id,
+                "price_cents": observation.price_cents,
+                "status": observation.status,
+                "source": observation.source,
+                "store": store_name,
+                "suburb": suburb,
+                "device_id": observation.device_id,
+                "note": observation.note,
+                "photo_url": observation.photo_url,
+                "photo_token": photo_token,
+                "observed_at": observation.observed_at,
+            }
+        )
+
     return [
         {
             "slug": product.slug,
@@ -398,10 +637,64 @@ def pending_products(
             "size_ml": product.size_ml,
             "pack_count": product.pack_count,
             "barcode": product.normalised_barcode or product.barcode,
-            "observations": int(count or 0),
+            "observations": len(sightings[product.id]),
+            "sightings": sightings[product.id],
             "created_at": product.created_at,
         }
-        for product, count in rows
+        for product in products
+    ]
+
+
+@router.get("/observations", summary="Price rows awaiting a moderation decision")
+def observations(
+    status_filter: str = Query(
+        default="needs_review",
+        alias="status",
+        pattern="^(accepted|needs_review|rejected)$",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    """Observations outside the pending-product queue (outliers on known cans).
+
+    The pending product list only shows rows for products nobody has curated yet;
+    a crowd price on an existing product can still be flagged by the outlier
+    check, and that decision lives here.
+    """
+    rows = session.execute(
+        select(
+            Observation,
+            Product.slug,
+            Product.brand,
+            Product.name,
+            Store.name,
+            Device.display_name,
+            Photo.token,
+        )
+        .join(Product, Product.id == Observation.product_id)
+        .outerjoin(Store, Store.id == Observation.store_id)
+        .outerjoin(Device, Device.id == Observation.device_id)
+        .outerjoin(Photo, Photo.id == Observation.photo_id)
+        .where(Observation.status == status_filter)
+        .order_by(Observation.observed_at.desc(), Observation.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": observation.id,
+            "product_slug": slug,
+            "product_label": f"{brand} {name}".strip(),
+            "price_cents": observation.price_cents,
+            "status": observation.status,
+            "source": observation.source,
+            "store": store_name,
+            "device": device_name,
+            "note": observation.note,
+            "photo_url": observation.photo_url,
+            "photo_token": photo_token,
+            "observed_at": observation.observed_at,
+        }
+        for observation, slug, brand, name, store_name, device_name, photo_token in rows
     ]
 
 
@@ -463,20 +756,42 @@ def reject_product(slug: str, session: Session = Depends(get_session)) -> dict:
 def recent_photos(
     limit: int = Query(default=50, ge=1, le=200), session: Session = Depends(get_session)
 ) -> list[dict]:
+    """List recent uploads, with the sighting each one backs.
+
+    A photo can be attached to more than one sighting; the newest one is
+    reported, because that is the row a reviewer opening the photo from the
+    moderation queue would expect to land on.
+    """
     from ..models import Photo
 
-    return [
-        {
-            "id": photo.id,
-            "token": photo.token,
-            "url": f"/v1/photos/{photo.token}",
-            "uploaded_by": photo.uploaded_by,
-            "bytes": photo.bytes,
-            "created_at": photo.created_at,
-            "pruned_at": photo.pruned_at,
-        }
-        for photo in session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit))
-    ]
+    photos = list(session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit)))
+    photo_ids = [photo.id for photo in photos]
+    sightings: dict[int, Observation] = {}
+    if photo_ids:
+        for observation in session.scalars(
+            select(Observation)
+            .where(Observation.photo_id.in_(photo_ids))
+            .order_by(Observation.observed_at.desc(), Observation.id.desc())
+        ):
+            sightings.setdefault(observation.photo_id, observation)
+    out = []
+    for photo in photos:
+        linked = sightings.get(photo.id)
+        out.append(
+            {
+                "id": photo.id,
+                "token": photo.token,
+                "url": f"/v1/photos/{photo.token}",
+                "uploaded_by": photo.uploaded_by,
+                "bytes": photo.bytes,
+                "created_at": photo.created_at,
+                "pruned_at": photo.pruned_at,
+                "observation_id": linked.id if linked is not None else None,
+                "product_id": linked.product_id if linked is not None else None,
+                "store_id": linked.store_id if linked is not None else None,
+            }
+        )
+    return out
 
 
 @router.post("/alerts/evaluate", summary="Run the price-alert evaluation now")

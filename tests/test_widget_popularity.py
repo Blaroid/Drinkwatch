@@ -193,3 +193,20 @@ def test_chain_wide_rows_from_two_chains_add_up(
     session.commit()
 
     assert _slugs(session, monkeypatch) == ["both-chains", "one-store"]
+
+
+def test_pending_products_never_reach_the_default_widget(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crowd-submitted can is not pickable until an admin reviews it."""
+    _chains_and_stores(session)
+    _product(session, 1, "monster-ultra", "Monster", "Ultra")
+    pending = _product(session, 2, "monster-smoke-test-500ml", "Monster", "Smoke Test")
+    pending.status = "pending"
+    _obs(session, 100, product_id=1, store_id=1, chain_id=1)
+    _obs(session, 101, product_id=2, store_id=1, chain_id=1)
+    session.commit()
+
+    # The price stub answers for any catalogue row, so a pending drink reaching
+    # the default list would show up here.
+    assert _slugs(session, monkeypatch) == ["monster-ultra"]

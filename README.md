@@ -16,8 +16,10 @@ scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
   7-Eleven, Vibe, Ampol, BP) with coordinates, from OpenStreetMap.
 * Scrapes the chains that publish prices, and stores one price ledger that both
   sources write into.
-* Accepts **crowd sightings** from the app: price, photo of the tag, scanned
-  barcode, and (for unknown cans) the name off the label.
+* Resolves **scanned barcodes** for Woolworths and Coles cans: both chains
+  publish the printed GTIN on their product pages. Accepts **crowd sightings**
+  from the app for everything else: price, photo of the tag, scanned barcode,
+  and (for unknown cans) the name off the label.
 * Serves small JSON for the phone widget.
 * Answers the questions that need maths: *which store is cheapest for this list*,
   *what is the best use of $20 if I only care about caffeine*, *is the drive worth
@@ -108,10 +110,11 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
       notify.py            price alert evaluation -> notifications
       scheduler.py         APScheduler jobs
       api/                 public, crowd, admin, photos, barcode, basket, alerts, appdownload
-      scrape/              spudshed, woolworths, coles, iga, fuelwatch, normalize, runner
-    scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke
+      scrape/              spudshed, woolworths, coles, iga, gtin, fuelwatch, normalize, runner
+    scripts/               seed, migrate, backfill, backfill_barcodes, barcode_report,
+                           clean_names, photos-sync, smoke, purge_smoke, review
     migrations/            SQL migrations, applied in filename order
-    docs/                  screenshots
+    photos/                uploaded price-tag images, served by /v1/photos
 
 ## Configuration
 
@@ -120,25 +123,47 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 | `DATABASE_URL` | postgres in compose | Postgres DSN |
 | `PUBLIC_BASE_URL` | http://127.0.0.1:8788 | links in API responses |
 | `ADMIN_TOKEN` | - | required for `/v1/admin/*` |
-| `SCRAPE_ENABLED` | true | master switch for scrapers |
+| `SCRAPE_ENABLED` | true | master switch for scrapers; does not stop alert or digest timers |
 | `SCRAPE_USER_AGENT` | DrinkWatch/0.1 | honest bot UA for seeding/geocoding |
 | `SCRAPE_BROWSER_UA` | Chrome 131 | Woolworths/Coles entry pages |
-| `SCHEDULER_ENABLED` | true | in-process APScheduler |
+| `SCHEDULER_ENABLED` | true | in-process APScheduler (scrape jobs follow `SCRAPE_ENABLED`) |
 | `PHOTOS_DIR` / `PHOTOS_HOST_DIR` | /srv/photos, ./photos | photo cache |
 | `OFF_LOOKUP_ENABLED` | true | Open Food Facts suggestion fallback |
+| `BARCODE_LOOKUP_LIMIT` | 8 | product-detail GTIN lookups per scraped chain per run |
 | `FUELWATCH_ENABLED` | true | FuelWatch WA RSS for ULP prices |
 | `VEHICLE_L_PER_100KM` | 8.5 | fuel estimate for route plans |
 | `MAX_BUDGET_CENTS` | 20000 | cap for the budget optimiser |
 | `DAILY_CAFFEINE_LIMIT_MG` | 400 | guideline used by the gauge |
+| `TRUSTED_PROXY_HOPS` | 0 | proxies in front of the API; how much of `X-Forwarded-For` to believe |
 
 ## Data resets
 
 The barcode index was purged on 2026-11-19 (the seeded codes were a mix of
 GTIN-14 retailer strings, internal codes and test rows). `barcodes`,
 `products.barcode`/`normalised_barcode` and `listings.barcode` were cleared;
-a dump of the old table is in `backups/barcodes-*.sql`. New codes arrive from
-crowd scans (`POST /v1/products/pending`) and from the next scrape of a chain
-that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
+a dump of the old table is in `backups/barcodes-*.sql`.
+
+New codes are read from the product-detail pages of the two chains that publish
+a GTIN: Woolworths' `/apis/ui/product/detail/<stockcode>` (`Product.Barcode`)
+and Coles' `/product/<id>` page (`gtin` in both the JSON-LD and the Next.js
+`pageProps`). Their search payloads carry `Barcode: null` on every tile, and
+SpudShed publishes no GTIN at all, so SpudShed/IGA/petrol-station cans stay
+crowd-only. Scrapes discover a few codes per run (`BARCODE_LOOKUP_LIMIT`); to
+fill the existing backlog, and to measure the gap:
+
+    python scripts/backfill_barcodes.py             # dry run, rate-limited
+    python scripts/backfill_barcodes.py --apply
+    python scripts/barcode_report.py
+
+`scripts/backfill.py` still re-indexes every code already stored on a product or
+listing.
+
+The rows the smoke test left behind were purged on 2026-11-19 with
+`scripts/purge_smoke.py --apply` (a dry run by default): a `smoke-test` device
+per run (the crowd leaderboard's top three), its sightings, photos and alerts,
+and the pending "Smoke Test" can in the review queue. From now on every run's
+rows carry the markers in `scripts/smoke.py`, so `smoke.py --cleanup` finds the
+ones from the current run.
 
 ## Operations
 
@@ -151,16 +176,30 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   copies after 14 days (`scripts/photos-sync.sh`). Before a file is removed the sync
   script marks its `photos` row `pruned_at`, so `/v1/photos/{token}` answers 410
   instead of pointing at a file that is no longer there.
-* **Backups** - data lives in the `drinkwatch_pgdata` volume:
-  `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz`
+* **Backups** - data lives in the `drinkwatch_pgdata` volume. Dump into the
+  gitignored `backups/` directory (the same files are mirrored to the redmax
+  backup disk):
+  `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backups/backup-$(date +%F).sql.gz`
 * **Restore drill** - a restore that leaves `schema_migrations` empty makes the
-  next boot replay the whole chain, so practise it: restore into an empty
-  database (`gunzip -c backup.sql.gz | psql ...`), run
-  `python scripts/migrate.py`, then start the API so the entrypoint's schema
-  check compares keys and constraints, not just columns.
+  next boot replay the whole chain, so practise it against the day's dump in a
+  scratch database, never the live one:
+  `docker compose exec -T db createdb -U drinkwatch restore_drill`, then
+  `gunzip -c backups/backup-2026-11-19.sql.gz | docker compose exec -T db psql -U drinkwatch -d restore_drill`,
+  then run `scripts/migrate.py` with `DATABASE_URL` pointed at `restore_drill`
+  and start the API so the entrypoint's schema check compares keys and
+  constraints, not just columns.
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
-  exercises 30 read/crowd/plan paths. It writes real rows; clean them with the SQL
-  in the script header.
+  exercises 30 read/crowd/plan paths. It writes real rows: a device, crowd
+  sightings, a photo and a pending product, tagged with the markers in the
+  script header (device name and version, note prefix, product title).
+  `python scripts/smoke.py --cleanup` reports them and `--cleanup --apply`
+  deletes them, along with the `price_daily` rows they wrote;
+  `python scripts/purge_smoke.py --apply` is the same cleanup for a backlog.
+* **Moderation** - `python scripts/review.py queue` prints the pending products
+  with each crowd sighting (price, store, note, tag photo) and the observations
+  flagged for review. `approve` / `reject` decide a product, `links` proposes
+  cross-chain duplicates and `confirm` links a pair. Every write is a dry run
+  until `--apply`, so a mistyped slug does not change production.
 
 ## Data model notes
 
@@ -172,7 +211,9 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   confirms). Prices are merged across a group at query time.
 * `barcodes` maps *every* code form (EAN-13, GTIN-14, UPC-A, retailer-internal
   codes) to a product, because Woolworths' 14-digit codes do not survive naive
-  normalisation.
+  normalisation. The scrapers fill it from the chains' product-detail pages;
+  `barcode_cache` remembers a per-SKU lookup miss so a code-less product is not
+  re-fetched every day.
 * `observations` is the append-only price ledger. `store_id` is NULL for
   chain-wide online prices. A `dedupe_key` makes scraper writes idempotent.
 * `price_daily` keeps one row per (day, chain, product, store) so deal badges still
@@ -189,8 +230,17 @@ change bumps it and lands as one commit:
     0.1.1  clean product names ("Original" fallback)
     0.2.0  typo-tolerant product search (pg_trgm)
     0.3.1  /v1/widget?suggest for "end of your list" suggestions
+    0.3.2  install page explains self-updating
     0.3.3  price_daily keeps a row per store, plus the chain-level aggregate
-    docs   README / API.md only, no version bump
+    0.5.0  freshness, state, fuel, caffeine, crowd and widget fixes (issue #1)
+    0.5.1  migrations run before serving; boot refuses a schema mismatch
+    0.5.2  barcode index purged (retailer and test codes resolved to the wrong can)
+    0.6.0  FuelWatch feed, receipt quota, photo streaming, pack labels, widget scopes
+    0.6.1  FuelWatch suburb matching, with a state-median fuel fallback
+    0.7.0  bundles, nearby order, brand-only matching, barcode index, migration replay,
+           moderation -> price_daily, seed_spudshed guard
+
+Docs-only changes (README / API.md) land without a version bump.
 
 ## Legal and etiquette
 

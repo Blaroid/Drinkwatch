@@ -49,10 +49,16 @@ def run_chains(codes: list[str], store_ids: list[int] | None = None) -> dict[str
                     stats = scraper(session, store_ids=store_ids, stats=stats)
                     if stats.errors:
                         error = "; ".join(stats.errors[:3])
-                except Exception as exc:  # pragma: no cover - network paths
+                except Exception as exc:
                     log.exception("scrape failed for %s", code)
                     error = f"{type(exc).__name__}: {exc}"
                     session.rollback()
+                    # The rollback discarded whatever this run had not yet
+                    # committed, so the counters now describe writes that are
+                    # not there. A run that already committed a store/term is
+                    # under-counted rather than credited with invented rows,
+                    # which is the honest direction for a failed run summary.
+                    stats = ScrapeStats(chain=code)
                 finish_run(session, run, stats, error=error)
                 results[code] = stats.as_dict()
                 if stats.observations_written:

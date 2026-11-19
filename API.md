@@ -7,6 +7,15 @@ All money is integer cents. All timestamps are ISO 8601 UTC.
 Read endpoints are public. Writes need a device token. Rate limits:
 600 reads/minute/IP, 60 writes/hour/device.
 
+Both are enforced. Every `GET`/`HEAD` under `/v1/` is charged to the calling
+IP (a sliding minute, charged before routing, so a new route cannot forget it).
+`X-Forwarded-For` is only believed for as many rightmost hops as
+`TRUSTED_PROXY_HOPS` declares (default 0: the header is ignored and the socket
+peer is used). Every write route shares one hourly bucket per device - scanning
+a barcode, voting, uploading a photo and submitting a sighting all spend the
+same 60 - and a receipt batch is charged once for its whole docket rather than
+once per line.
+
 ## Widget contract (the thing the app should call)
 
     GET /v1/widget?lat=-31.9523&lon=115.8613&radius_km=15&products=monster-green-500ml,v-original-500ml
@@ -31,14 +40,17 @@ energy drinks. Optional `max_age_hours` (default 72).
           "distance_km": 0.0,
           "promo": "none",
           "source": "crowd",
+          "price_scope": "store",
           "age_hours": 0.0
         }
       ]
     }
 
 Payload is small on purpose (well under 2 KB for 8 items). `source` is `crowd`
-or `scrape`; show a "~" or "online" marker when the underlying price came from
-`/v1/prices` with `price_scope=chain`.
+or `scrape`; `price_scope` is `store` for a price seen on that shop's shelf and
+`chain` when it is the chain's own online price attributed to the shop. Mark a
+`chain` row (the old clients inferred it from `source`, which called every
+scraped SpudShed store price "online").
 
 ## Reads
 
@@ -51,6 +63,11 @@ or `scrape`; show a "~" or "online" marker when the underlying price came from
     GET /v1/prices?product={slug}&lat&lon&radius_km&max_age_hours=72&chain=
     GET /v1/compare?products=slug1,slug2&lat&lon&radius_km
     GET /v1/observations?product={slug}&store_id=&source=crowd&limit=50
+    GET /v1/observations?include_flagged=true   // also needs_review rows
+
+`/v1/products`, `/v1/catalogue`, `/v1/deals` and the widget's default and
+suggestion lists only contain `verified` products, so a crowd-submitted row
+waiting at `status=pending` cannot be picked before review.
 
 /v1/prices returns the product plus every nearby store that has a fresh price,
 cheapest first:
@@ -132,6 +149,11 @@ hour before it. Different devices reporting the same price are the same fact, so
 carries the full tally too. Each report is still stored, so the count is the
 crowd agreeing with itself rather than a repeated click by one device.
 
+The feed only lists `status: "accepted"` rows, because a `needs_review` outlier
+is not a price any other endpoint will quote. Every row carries its `status`,
+and `include_flagged=true` also returns the quarantined rows so a client can
+badge them instead of hiding them.
+
 Confirm or dispute someone else's sighting:
 
     POST /v1/observations/{id}/vote   {"vote": 1}   // or -1
@@ -164,16 +186,26 @@ Your own history and profile:
     GET  /v1/admin/products/suggestions?brand=Monster&min_score=0.34
     POST /v1/admin/observations/{id}/status {"status": "accepted|needs_review|rejected"}
     GET  /v1/admin/devices
+    GET  /v1/admin/barcodes?product_slug=&source=&barcode=
+    POST /v1/admin/barcodes/{code}/map {"product_slug": "..."}
+    DELETE /v1/admin/barcodes/{code}
 
 A status change is applied to the daily price ledger too, so approving a flagged
 price adds it to the deal history and rejecting one takes it back out.
+
+The barcode index is written by the crowd, so it needs the same moderation: map a
+code that landed on the wrong can, or delete a binding that should not exist.
+Both act on every form of the code (EAN-13, its GTIN-14, UPC-A) and on the
+product's own barcode column, because either one alone resolves a scan. A re-map
+takes the code away from every other product that still carries it; a delete
+reports one that keeps resolving it, under `other_products`, rather than claiming
+the code is unbound.
 
 ## Errors
 
     {"detail": "unknown product slug: foo"}    // 404, 422, 409, 429, 401, 403
 
 429 responses carry `Retry-After`. 503 on /v1/admin/* means ADMIN_TOKEN is unset.
-
 
 ## Scanning and onboarding
 
@@ -188,6 +220,14 @@ Accepts EAN-13, GTIN-14 (Woolworths' 14-digit codes), UPC-A and retailer-interna
 codes; all forms of the same product resolve. `checksum_ok` is advisory - some
 retailer codes are not valid GTINs.
 
+Coverage follows what the chains publish. Woolworths and Coles put the printed
+GTIN on their product-detail pages, and the scrapers index those codes, so a can
+bought at either chain resolves. SpudShed publishes no GTIN, and IGA has no
+chain-wide feed, so those cans (and any code not yet indexed) return
+`found: false`; the app should then collect the name and size off the label and
+POST /v1/products/pending. When the crowd has already identified that code, the
+same scan resolves immediately and only attaches the price.
+
     POST /v1/products/pending            (device auth)
     {"barcode": "9300633099999", "name": "V Energy Berry 500mL", "brand": "V",
      "size_ml": 500, "pack_count": 1, "photo_token": "...", "store_id": 556,
@@ -197,6 +237,16 @@ retailer codes are not valid GTINs.
 Creates a `pending` product (name is required - that is the point) and optionally a
 price sighting. If the barcode already resolves, it returns that product with
 `created: false` and just attaches the price.
+
+Only a submission that created the product indexes its code: binding a code to a
+can that already existed is how a misread or a deliberate one became permanent,
+and the admin routes above are the way to correct a binding. The code also has to
+carry a valid GTIN check digit, unless a chain published it in a listing - that
+is how Woolworths' GTIN-14s and retailer-internal codes still get through.
+
+An Open Food Facts answer is cached for 30 days and then asked again, and a
+failure (429, 5xx) is not cached as "not found" at all. Both barcode routes are
+rate limited per client.
 
 ## Photos
 
@@ -216,6 +266,13 @@ from the same device returns the existing row (unless that row was pruned).
 
 A pruned row (local cache passed its 14 day retention) answers 410, never 404, so a
 client can tell "gone" apart from a URL it built wrongly.
+
+A sighting may name a `photo_token` (from this endpoint). It must be the upload
+device's own photo and it must not be pruned; anything else is rejected with
+`422 unknown photo token`. The observation response, `GET /v1/observations` and
+`GET /v1/me/observations` carry the attached `photo_token` and `photo_url` so the
+evidence can be shown; rows from before photo uploads carry only the legacy
+`photo_url` when the client supplied one.
 
 ## Plans
 
@@ -243,7 +300,9 @@ Stores that cannot cover every item come back with `complete: false` and sort la
 
 `product_slug` and `label` name the pack the optimiser actually bought, so they
 always agree with `cost_cents` and `breakdown`: a plan of two singles is labelled
-as the single, never as the x4 pack. `/v1/plan/route` items carry the same fields.
+as the single, never as the x4 pack. `/v1/plan/route` items carry the same
+`BasketLineOut` fields (`units`, `price`, ...) and keep `cost` as a deprecated
+alias of `price` for builds that still read it.
 
     GET /v1/value/max-caffeine?budget_cents=2000&lat=-31.9523&lon=115.8613
         &radius_km=25&mode=single_store|multi_store&include_specials=true
@@ -294,8 +353,13 @@ There are two triggers and either is enough: `max_price_cents` (an absolute
 ceiling) and `min_drop_percent` (a fall of at least that many percent below the
 product's 30-day median in that chain). `lat`/`lon`/`radius_km` — all three or
 none — limit evaluation to stores within that radius; without them an alert
-scans every active store, as it always did. `chain_code` and `store_id` narrow
+scans every active store, with no cap. `chain_code` and `store_id` narrow
 the scan further and still work alongside the radius.
+
+Evaluation is safe to start from several places at once (the 30-minute timer,
+the call after each scrape, `POST /v1/admin/alerts/evaluate`): an alert is
+claimed in the database before its notification is written, so overlapping runs
+cannot queue the same alert twice.
 
 ## Batch and receipts
 
@@ -307,7 +371,18 @@ the scan further and still work alongside the radius.
     POST /v1/receipts/parse           (device auth)
     {"text": "MONSTER ULTRA 4PK 17.50\nV ENERGY BLUE 250ML 3.29\nBANANAS 4.50"}
     200 [{"line": "MONSTER ULTRA 4PK 17.50", "price_cents": 1750,
-          "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 0.67}]
+          "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 1.0,
+          "alternatives": []},
+         {"line": "V ENERGY BLUE 250ML 3.29", "price_cents": 329,
+          "product_slug": "v-blue-250ml", "label": "V Blue", "score": 1.0,
+          "alternatives": []}]
+
+The size and pack count on the line (`250mL`, `4PK`, `x4`, `24 pack`) decide
+which row may match: a line that says `4PK` never scores the single can, and a
+line whose size or pack matches no row comes back with `product_slug: null`.
+When two rows still score the same, `product_slug` is the first and
+`alternatives` lists the rest so the user can choose instead of the database
+order choosing for them.
 
 A batch is charged against the hourly crowd write quota once, for its whole
 line count, rather than once per line: a receipt is one act of reporting. If
@@ -330,9 +405,19 @@ substring matches, and distance annotates (and sorts) when lat/lon are given.
 
 ## Admin additions
 
-    GET  /v1/admin/products/pending
+    GET  /v1/admin/products/pending           pending products, each with its
+                                              crowd sightings (price, store, note,
+                                              photo_token, observation status)
     POST /v1/admin/products/{slug}/approve   {"size_ml": 500, "caffeine_mg_per_100ml": 32,
                                               "merge_into_slug": null}
     POST /v1/admin/products/{slug}/reject
+    GET  /v1/admin/observations?status=needs_review&limit=100
     GET  /v1/admin/photos?limit=50
+         -> [{id, token, url, uploaded_by, bytes, created_at, pruned_at,
+              observation_id, product_id, store_id}]
     POST /v1/admin/alerts/evaluate           -> {"notifications_created": 1}
+
+`scripts/review.py` is the operator client for these: `queue` prints both review
+queues with their evidence, `approve` / `reject` / `confirm` write, and
+`observation ID accepted|needs_review|rejected` decides a single sighting. Writes
+are dry runs unless `--apply` is passed.

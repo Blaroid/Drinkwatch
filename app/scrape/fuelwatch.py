@@ -20,6 +20,12 @@ log = logging.getLogger(__name__)
 
 FEED_URL = "https://www.fuelwatch.wa.gov.au/fuelwatch/fuelWatchRSS"
 CACHE_TTL_SECONDS = 1800
+# A failed read is remembered for a minute. The feed is ~700 KB behind a 20 s
+# timeout, and one route plan asks for the map several times, so retrying every
+# request turns a down feed into a 20 s stall per request.
+FAILURE_TTL_SECONDS = 60
+# "product:<n>" holds the last good map, "failed:<n>" the time of the last failed
+# attempt. Both live in one dict so resetting the cache clears the backoff too.
 _cache: dict[str, tuple[float, dict[str, int]]] = {}
 
 PRICE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*:")
@@ -63,6 +69,10 @@ def ulp_prices(product: int = 1) -> dict[str, int]:
     so asking for one suburb caps the map at a handful of localities and every
     plan elsewhere silently falls back to FUEL_PRICE_CENTS_PER_L. One ~700 KB
     read per 30 minutes is cheap next to that.
+
+    A failed read is remembered for ``FAILURE_TTL_SECONDS`` and the last good
+    map, if one was ever read, is served in the meantime: stale prices beat no
+    prices, and the feed being down must not cost every plan its 20 s timeout.
     """
     if not settings.fuelwatch_enabled:
         return {}
@@ -70,15 +80,20 @@ def ulp_prices(product: int = 1) -> dict[str, int]:
     cached = _cache.get(key)
     if cached and time.monotonic() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
+    failure = _cache.get(f"failed:{product}")
+    if failure and time.monotonic() - failure[0] < FAILURE_TTL_SECONDS:
+        return cached[1] if cached else {}
     try:
         with httpx.Client(timeout=20.0, headers={"User-Agent": settings.scrape_user_agent}) as client:
             response = client.get(FEED_URL, params={"Product": product})
             response.raise_for_status()
             prices = _parse(response.text)
-    except Exception as exc:  # pragma: no cover - network path
+    except Exception as exc:
         log.warning("fuelwatch unavailable: %s", exc)
-        return {}
+        _cache[f"failed:{product}"] = (time.monotonic(), {})
+        return cached[1] if cached else {}
     _cache[key] = (time.monotonic(), prices)
+    _cache.pop(f"failed:{product}", None)
     return prices
 
 

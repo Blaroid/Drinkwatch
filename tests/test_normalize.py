@@ -7,7 +7,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.scrape.normalize import barcode_variants, normalize_barcode, parse_pack
+from app.scrape.normalize import (
+    barcode_variants,
+    normalize_barcode,
+    parse_pack,
+    parse_pack_tokens,
+    receipt_tokens,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +34,19 @@ from app.scrape.normalize import barcode_variants, normalize_barcode, parse_pack
         # A bare count with no per-unit size, e.g. a carton line.
         ("(24x Pack)", (None, 24)),
         ("24 pack", (None, 24)),
+        # Size first, count after: a chain's "N pack of 500mL cans" spelling.
+        ("Rockstar Guava Punch 500ml x 12", (500, 12)),
+        ("Red Bull Energy Drink Cans 473mL x 12", (473, 12)),
+        # PackageSize-style text that names a pack but no size at all.
+        ("Rockstar Energy Drink 500mL 4 Pack", (500, 4)),
+        # Count-first and a carton total in the same string: the can size still
+        # comes from the count-sized pair, not from the total.
+        ("Red Bull Energy Drink 12x250ml 3L", (250, 12)),
+        ("V Energy Blue 4x250ml 1L", (250, 4)),
+        # The total can be the size written next to the count instead: dividing
+        # it by the count recovers the can rather than inventing a 6 L one.
+        ("6000ML V Energy 24 Pack", (250, 24)),
+        ("V Energy 6000ML x 24", (250, 24)),
     ],
 )
 def test_parse_pack(text: str | None, expected: tuple[int | None, int]) -> None:
@@ -36,6 +55,68 @@ def test_parse_pack(text: str | None, expected: tuple[int | None, int]) -> None:
 
 def test_parse_pack_treats_a_missing_count_as_a_single() -> None:
     assert parse_pack("V Energy 500mL single") == (500, 1)
+
+
+def test_parse_pack_reads_the_carton_count_a_title_ties_to_its_size() -> None:
+    # Woolworths titles these cartons "(4 Pack) 250mL 24 Pack": the count written
+    # after the size is the carton (PackageSize for the same listing is 6000ML,
+    # and $69.50 is a 24-can price), while the bracketed 4-pack is the inner pack.
+    assert parse_pack("V Energy Drink Blue (4 Pack) 250mL 24 Pack") == (250, 24)
+    assert parse_pack("V Energy Drink Cans 250mL 24 Pack") == (250, 24)
+
+
+def test_parse_pack_derives_the_pack_count_from_a_carton_total() -> None:
+    # PackageSize "6000ML" is 24 x 250mL; the can size is only in the name, so
+    # the two fields have to be parsed together or the carton total becomes a
+    # can size (the phantom "v-blue-6000ml" product).
+    assert parse_pack("6000ML V Energy Drink Blue 250mL") == (250, 24)
+    assert parse_pack("1L V Energy Blue 4x250ml") == (250, 4)
+    # The count can be written straight after the total: 6000 / 24 = 250mL.
+    assert parse_pack("6000ML V Energy 24 Pack") == (250, 24)
+
+
+def test_parse_pack_will_not_invent_a_six_litre_can() -> None:
+    # A lone volume past the largest single container (2 L) is a carton total
+    # with nothing to divide by; the size stays unknown rather than invented.
+    assert parse_pack("6000ML") == (None, 1)
+    assert parse_pack("3L") == (None, 1)
+    # The same total without a count to divide by is still not a can.
+    assert parse_pack("6000ML V Energy") == (None, 1)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Nothing stated is not the same as one unit: receipt matching must be
+        # able to tell a bare name from a line that says "250mL".
+        (None, (None, None)),
+        ("", (None, None)),
+        ("Monster Ultra", (None, None)),
+        ("Monster Ultra 250mL", (250, 1)),
+        ("Monster Ultra 4PK", (None, 4)),
+        ("Monster Ultra x4", (None, 4)),
+        ("Monster Ultra 24 pack", (None, 24)),
+        ("Monster Ultra 4 x 500mL", (500, 4)),
+        ("Monster Ultra 500mL x 4", (500, 4)),
+    ],
+)
+def test_parse_pack_tokens_reports_only_what_the_line_states(
+    text: str | None, expected: tuple[int | None, int | None]
+) -> None:
+    assert parse_pack_tokens(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("MONSTER ULTRA 4PK", {"monster", "ultra"}),
+        ("V ENERGY BLUE 250ML", {"v", "blue"}),
+        ("V ENERGY BLUE X4", {"v", "blue"}),
+        ("Monster Aussie Lemonade 500mL x 4", {"monster", "aussie", "lemonade"}),
+    ],
+)
+def test_receipt_tokens_drop_the_size_and_pack(text: str, expected: set[str]) -> None:
+    assert receipt_tokens(text) == expected
 
 
 @pytest.mark.parametrize(

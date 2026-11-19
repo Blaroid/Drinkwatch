@@ -11,10 +11,36 @@ from sqlalchemy.orm import Session
 from ..models import Product
 
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L|litres?|liters?)\b")
-PACK_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b")
+PACK_X_RE = re.compile(
+    r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b", re.IGNORECASE
+)
+# "500mL x 12": the size first and the count after it, which the chains use for
+# cartons as often as the "12 x 500mL" spelling PACK_X_RE reads.
+SIZE_X_COUNT_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\s*[x×]\s*(\d{1,2})\b", re.IGNORECASE
+)
 PACK_WORD_RE = re.compile(r"\b(\d{1,2})\s*(?:pack|pk|p)\b", re.IGNORECASE)
 # "(24x Pack)" / "24x carton": count before an "x", no per-unit size.
 PACK_COUNT_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(?:pack|pk|carton|box)\b", re.IGNORECASE)
+# "250mL 24 Pack": a count written straight after the size it counts. The
+# chains put the carton quantity there, which is why it beats a bracketed inner
+# pack in a title like "V Energy Drink Blue (4 Pack) 250mL 24 Pack".
+SIZE_ATTACHED_PACK_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b[^0-9]{0,16}?(\d{1,2})\s*(?:pack|pk)\b",
+    re.IGNORECASE,
+)
+# "(4 Pack) 250mL": the pack a carton title leads with, bracketed off the flavour.
+PAREN_PACK_RE = re.compile(r"\(\s*(\d{1,2})\s*(?:pack|pk)\s*\)", re.IGNORECASE)
+# Every spelling of a stated pack count, for a title that states one without
+# tying it to a size.
+PACK_MARKER_RES = (PAREN_PACK_RE, PACK_COUNT_X_RE, PACK_WORD_RE)
+# The biggest single container the chains list is a 2 L bottle; a larger volume
+# in a title is a carton total, not a can size.
+MAX_SINGLE_ML = 2000
+# The longest carton published; past this the two numbers are not a pack count.
+MAX_PACK_COUNT = 48
+# "x4" after the size: the way dockets abbreviate a multipack ("500mL X4").
+PACK_SUFFIX_X_RE = re.compile(r"\b[x×]\s*(\d{1,2})\b", re.IGNORECASE)
 # A token that is just a count ("24", "24x") is never a flavour.
 COUNT_TOKEN_RE = re.compile(r"^\d+x?$")
 
@@ -76,29 +102,159 @@ def parse_money(text: str | None) -> int | None:
 
 
 def parse_pack(text: str | None) -> tuple[int | None, int]:
-    """Return (size_ml_per_unit, pack_count) from strings like '500mL x 4 pack' or '2L'."""
+    """Return (size_ml_per_unit, pack_count) from strings like '500mL x 4 pack' or '2L'.
+
+    Retailer titles state a carton in whichever order reads well - "4 x 500mL",
+    "500mL x 12", "(4 Pack) 250mL 24 Pack" - and Woolworths' PackageSize is
+    sometimes only the total volume of the carton ("6000ML" for 24 x 250mL). A
+    size read out of a carton is what turned a 12-pack into one very expensive
+    can, so every form is handled here and a lone carton volume stays unknown.
+    """
     if not text:
         return None, 1
-    pack_count = 1
-    size_ml: int | None = None
+    text = str(text)
+
+    # "4 x 500mL": count first, size attached to the unit.
+    count_first = PACK_X_RE.search(text)
+    if count_first:
+        pair = _stated_pack(
+            _to_ml(float(count_first.group(2)), count_first.group(3)),
+            int(count_first.group(1)),
+        )
+        if pair is not None:
+            return pair
+
+    # "500mL x 12" / "500mL x 4 pack": size first, count after it.
+    size_first = SIZE_X_COUNT_RE.search(text)
+    if size_first:
+        pair = _stated_pack(
+            _to_ml(float(size_first.group(1)), size_first.group(2)),
+            int(size_first.group(3)),
+        )
+        if pair is not None:
+            return pair
+
+    # "250mL 24 Pack": the count the title ties to the size is the carton.
+    attached = SIZE_ATTACHED_PACK_RE.search(text)
+    if attached:
+        pair = _stated_pack(
+            _to_ml(float(attached.group(1)), attached.group(2)),
+            int(attached.group(3)),
+        )
+        if pair is not None:
+            return pair
+
+    sizes = _size_tokens(text)
+    derived = _pack_from_total(sizes)
+    if derived is not None:
+        return derived
+    return _can_size(sizes), max(1, _declared_pack(text) or 1)
+
+
+def _stated_pack(size_ml: int | None, pack_count: int) -> tuple[int, int] | None:
+    """(can size, pack count) for one size/count pair in the text, or None.
+
+    A pair can state the carton's total volume instead of a can - PackageSize
+    "6000ML" next to a "24 Pack" title - and reading that as the unit is exactly
+    how the phantom 6 L can was made. Dividing the total by the count recovers
+    the can, and an indivisible total is left for the rules that do not treat it
+    as a container.
+    """
+    if size_ml is None:
+        return None
+    pack_count = max(1, pack_count)
+    if size_ml <= MAX_SINGLE_ML:
+        return size_ml, pack_count
+    if pack_count > 1 and size_ml % pack_count == 0:
+        can_ml = size_ml // pack_count
+        if can_ml <= MAX_SINGLE_ML:
+            return can_ml, pack_count
+    return None
+
+
+def _size_tokens(text: str) -> list[int]:
+    """Every volume named in the text, in the order the text names them."""
+    return [_to_ml(float(match.group(1)), match.group(2)) for match in SIZE_RE.finditer(text)]
+
+
+def _declared_pack(text: str) -> int | None:
+    """The first pack count the text states, or None when it states none.
+
+    Only used when no count is tied to a size, so "(24x Pack)" and a bare
+    PackageSize of "4 Pack" are the cases this covers.
+    """
+    markers: list[tuple[int, int]] = []
+    for pattern in PACK_MARKER_RES:
+        markers.extend((match.start(), int(match.group(1))) for match in pattern.finditer(text))
+    if not markers:
+        return None
+    count = min(markers)[1]
+    return count if 2 <= count <= MAX_PACK_COUNT else None
+
+
+def _can_size(sizes: list[int]) -> int | None:
+    """The per-unit size: the smallest volume named that could be a single can.
+
+    A title that states the carton volume as well ("6000ML ... 250mL") names two
+    sizes and the can is the smaller one. A lone "6000ML" is not a can and stays
+    unknown rather than inventing a 6 L can.
+    """
+    single = [size for size in sizes if size <= MAX_SINGLE_ML]
+    return min(single) if single else None
+
+
+def _pack_from_total(sizes: list[int]) -> tuple[int, int] | None:
+    """(can size, pack count) when one named volume is a whole multiple of another.
+
+    Chains publish the carton volume next to the can size ("6000ML" for a carton
+    of 24 x 250mL) without spelling out the count; dividing recovers it. Ambiguous
+    totals go to the smallest can, which is the one the title is really selling.
+    """
+    best: tuple[int, int] | None = None
+    for can in sizes:
+        if can > MAX_SINGLE_ML:
+            continue
+        for total in sizes:
+            if total <= can or total % can:
+                continue
+            pack_count = total // can
+            if 2 <= pack_count <= MAX_PACK_COUNT and (best is None or can < best[0]):
+                best = (can, pack_count)
+    return best
+
+
+def parse_pack_tokens(text: str | None) -> tuple[int | None, int | None]:
+    """Return the size and pack count a line *states*, None where it is silent.
+
+    ``parse_pack`` is for a retailer title, which always describes one SKU, so a
+    missing count means one unit. A receipt line is different: it may name the
+    pack ("4PK") and leave the size to the catalogue, or name the size and say
+    nothing about a pack. Keeping "unstated" separate from "one" is what lets
+    the matcher refuse a 4-pack row for a plain "250mL" line.
+    """
+    if not text:
+        return None, None
 
     multi = PACK_X_RE.search(text)
     if multi:
-        pack_count = int(multi.group(1))
-        size_ml = _to_ml(float(multi.group(2)), multi.group(3))
-    elif PACK_COUNT_X_RE.search(text):
-        pack_count = int(PACK_COUNT_X_RE.search(text).group(1))
+        return _to_ml(float(multi.group(2)), multi.group(3)), int(multi.group(1))
+
+    carton = PACK_COUNT_X_RE.search(text)
+    if carton:
         single = SIZE_RE.search(text)
-        if single:
-            size_ml = _to_ml(float(single.group(1)), single.group(2))
-    else:
-        single = SIZE_RE.search(text)
-        if single:
-            size_ml = _to_ml(float(single.group(1)), single.group(2))
-        word = PACK_WORD_RE.search(text)
-        if word:
-            pack_count = int(word.group(1))
-    return size_ml, max(1, pack_count)
+        size_ml = _to_ml(float(single.group(1)), single.group(2)) if single else None
+        return size_ml, int(carton.group(1))
+
+    single = SIZE_RE.search(text)
+    size_ml = _to_ml(float(single.group(1)), single.group(2)) if single else None
+    word = PACK_WORD_RE.search(text)
+    if word:
+        return size_ml, int(word.group(1))
+    suffix = PACK_SUFFIX_X_RE.search(text)
+    if suffix:
+        return size_ml, int(suffix.group(1))
+    # A stated size with no pack word is one can; nothing stated is unknown.
+    return size_ml, (1 if size_ml is not None else None)
 
 
 def _to_ml(value: float, unit: str) -> int | None:
@@ -178,6 +334,22 @@ def flavour_tokens(text: str) -> set[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", cleaned)
     tokens = {t for t in cleaned.split() if t and not t.isdigit()}
     return {t for t in tokens if t not in NOISE_TOKENS}
+
+
+def receipt_tokens(text: str) -> set[str]:
+    """Flavour tokens from a docket line, with the size and pack removed.
+
+    ``flavour_tokens`` only drops bare digits, so "250ML" and "4PK" survive as
+    tokens and dilute every match (a perfect name scores 0.67). They are the
+    same tokens the matcher uses to filter rows, so they must not also count as
+    flavour evidence.
+    """
+    cleaned = PACK_X_RE.sub(" ", text)
+    cleaned = PACK_COUNT_X_RE.sub(" ", cleaned)
+    cleaned = PACK_WORD_RE.sub(" ", cleaned)
+    cleaned = PACK_SUFFIX_X_RE.sub(" ", cleaned)
+    cleaned = SIZE_RE.sub(" ", cleaned)
+    return flavour_tokens(cleaned)
 
 
 def clean_flavour(name: str, brand: str | None) -> str:

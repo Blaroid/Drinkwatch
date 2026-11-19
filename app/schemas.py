@@ -99,6 +99,9 @@ class WidgetItemOut(BaseModel):
     distance_km: float | None = None
     promo: str
     source: str
+    # store = a shelf price, chain = one online price standing for the chain.
+    # Optional so a client built against the old payload still parses it.
+    price_scope: str | None = None
     age_hours: float
     suggested: bool = False
 
@@ -167,6 +170,11 @@ class ObservationOut(BaseModel):
     source: str
     price_scope: str
     note: str | None = None
+    # Evidence for the sighting. photo_token is the /v1/photos handle and
+    # photo_url is the URL for the same image; legacy rows that stored only a
+    # client-supplied photo_url carry that URL with no token.
+    photo_token: str | None = None
+    photo_url: str | None = None
     observed_at: datetime
     status: str
     confirms: int = 0
@@ -326,6 +334,18 @@ class MaxCaffeineOut(BaseModel):
     stores_used: int
 
 
+class RouteLineOut(BasketLineOut):
+    """One route stop's line: the basket-line shape plus the legacy ``cost`` key.
+
+    API.md has always promised route items carry the same fields as basket
+    lines, but they were hand-built dicts with ``cost`` and no ``units``/``price``,
+    so a client had to branch on which plan endpoint a line came from. ``cost``
+    is kept (same value as ``price``) for builds that still read it.
+    """
+
+    cost: str = Field(default="", description="deprecated alias of price")
+
+
 class RouteStopOut(BaseModel):
     store_id: int
     store_name: str
@@ -335,7 +355,7 @@ class RouteStopOut(BaseModel):
     lon: float | None = None
     subtotal_cents: int
     subtotal: str
-    items: list[dict] = []
+    items: list[RouteLineOut] = []
     distance_from_origin_km: float | None = None
 
 
@@ -444,12 +464,24 @@ class ReceiptParseIn(BaseModel):
     text: str = Field(min_length=3, max_length=20000)
 
 
+class ReceiptAlternative(BaseModel):
+    """Another catalogue row that matched a receipt line equally well."""
+
+    product_slug: str
+    label: str
+    score: float
+
+
 class ReceiptCandidate(BaseModel):
     line: str
     price_cents: int | None = None
     product_slug: str | None = None
     label: str | None = None
     score: float = 0.0
+    # Populated only when the line's size/pack tokens still leave more than one
+    # row with the same best score, so the user can pick instead of the
+    # database order deciding.
+    alternatives: list[ReceiptAlternative] = Field(default_factory=list)
 
 
 class LeaderboardEntry(BaseModel):

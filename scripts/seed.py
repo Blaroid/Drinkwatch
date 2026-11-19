@@ -21,6 +21,7 @@ import unicodedata
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 sys.path.insert(0, ".")
 
@@ -30,6 +31,12 @@ from app.models import Chain, Store  # noqa: E402
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 DEFAULT_BBOX = (-32.75, 115.55, -31.45, 116.25)
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+
+# Chains whose live store list comes from their own store chooser, keyed by the
+# external_ref prefix that chooser's rows carry (see scripts/seed_spudshed.py).
+# OpenStreetMap keeps stale entries for these chains, so their OSM rows are only
+# seeded until the authoritative list exists.
+AUTHORITATIVE_REF_PREFIXES = {"spudshed": "spudshed:"}
 
 CHAINS = [
     # code, display name, kind, scrape_enabled
@@ -196,12 +203,41 @@ def upsert_chain(session, code: str, name: str, kind: str, scrape_enabled: bool)
     return chain
 
 
-def upsert_store(session, chain: Chain, row: dict, dry_run: bool) -> bool:
+def authoritative_chains(session: Session) -> set[str]:
+    """Chain codes whose store list a non-OSM source already covers.
+
+    seed_spudshed.py deactivates the OSM rows its chooser does not list, so once
+    it has written a single spudshed:<slug> row those OSM rows are the stale
+    duplicates and must not be seeded (or probes run for them) again.
+    """
+    covered: set[str] = set()
+    for code, prefix in AUTHORITATIVE_REF_PREFIXES.items():
+        exists = session.scalar(
+            select(Store.id)
+            .join(Chain, Chain.id == Store.chain_id)
+            .where(Chain.code == code, Store.external_ref.startswith(prefix))
+            .limit(1)
+        )
+        if exists is not None:
+            covered.add(code)
+    return covered
+
+
+def upsert_store(session: Session, chain: Chain, row: dict) -> bool:
+    """Upsert an OSM-derived store row and report whether it was created.
+
+    Activation is only set on insert. seed_spudshed.py deliberately deactivates
+    OSM rows the SpudShed chooser does not list, and the two documented setup
+    steps used to undo each other: re-running seed.py flipped them back to
+    active, so the scraper hit the same shop twice and ten dead subdomains made
+    every run end in ``status = error``.
+    """
     store = session.scalar(
         select(Store).where(Store.chain_id == chain.id, Store.external_ref == row["external_ref"])
     )
-    if store is None:
-        store = Store(chain_id=chain.id, external_ref=row["external_ref"])
+    created = store is None
+    if created:
+        store = Store(chain_id=chain.id, external_ref=row["external_ref"], is_active=True)
         session.add(store)
     store.name = row["name"]
     store.suburb = row["suburb"]
@@ -211,8 +247,7 @@ def upsert_store(session, chain: Chain, row: dict, dry_run: bool) -> bool:
     store.lon = row["lon"]
     if row.get("website"):
         store.website = row["website"]
-    store.is_active = True
-    return True
+    return created
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -236,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
             code: upsert_chain(session, code, name, kind, enabled)
             for code, name, kind, enabled in CHAINS
         }
+        # Read before this run inserts anything, so the answer does not depend
+        # on which row happens to be processed first.
+        covered = authoritative_chains(session)
         if args.chains_only:
             return 0
 
@@ -243,6 +281,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.only_chain:
         rows = [row for row in rows if row["chain_code"] == args.only_chain]
     print(f"found {len(rows)} candidate stores")
+
+    skipped: dict[str, int] = {}
+    candidates: list[dict] = []
+    for row in rows:
+        if row["chain_code"] in covered and row["external_ref"].startswith("osm:"):
+            skipped[row["chain_code"]] = skipped.get(row["chain_code"], 0) + 1
+            continue
+        candidates.append(row)
+    rows = candidates
+    for code, count in skipped.items():
+        print(f"  {code}: skipped {count} OSM rows, the chain's own store list is authoritative")
+
     per_chain: dict[str, int] = {}
     spudshed_rows = [row for row in rows if row["chain_code"] == "spudshed"]
 
@@ -278,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         chains = {chain.code: chain for chain in session.scalars(select(Chain))}
         for row in rows:
             chain = chains[row["chain_code"]]
-            upsert_store(session, chain, row, args.dry_run)
+            upsert_store(session, chain, row)
             per_chain[row["chain_code"]] = per_chain.get(row["chain_code"], 0) + 1
     print("seeded:", per_chain)
     return 0

@@ -16,7 +16,7 @@ from sqlalchemy.sql.selectable import Subquery
 from .. import __version__
 from ..config import settings
 from ..db import get_session
-from ..models import Chain, Observation, Product, Store
+from ..models import Chain, Observation, Photo, Product, Store
 from ..schemas import (
     CatalogueOut,
     CatalogueProduct,
@@ -50,6 +50,7 @@ from .deps import (
     product_group_ids,
     utcnow,
 )
+from .photos import photo_url
 
 router = APIRouter(prefix="/v1", tags=["public"])
 
@@ -282,10 +283,11 @@ def _suggest_offers(
 
     The suggestion list only needs one offer per candidate, but
     ``_offers_for_product()`` costs roughly four round trips - two of them just
-    to resolve the alias group - which was being paid for each of up to 60
-    candidates. Here the whole candidate set shares one alias lookup and one
-    price query per scope, then reduces with the same ``(price, distance)``
-    rule and tie-break as ``_offers_for_product()[0]``.
+    to resolve the alias group - which would be paid for every candidate. Here
+    the whole candidate set shares one alias lookup and one price query per
+    scope, then reduces with the same ``(price, distance)`` rule and tie-break
+    as ``_offers_for_product()[0]``. Candidates without a fresh offer simply
+    have no entry in the result, which is the widget's suggestion pool.
 
     Deal stats are deliberately not fetched: the widget never serialises
     ``OfferOut.stats``, so the 90-day percentile query would be pure overhead.
@@ -443,7 +445,10 @@ def products(
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
 ) -> list[ProductOut]:
-    stmt = select(Product).where(Product.is_active.is_(True))
+    # Only verified rows: a crowd-submitted product sits at status='pending'
+    # until an admin reviews it, and listing it here put unreviewed cans in the
+    # app's pickers (search included, since the filters share this statement).
+    stmt = select(Product).where(Product.is_active.is_(True), Product.status == "verified")
     order = [Product.brand, Product.name, Product.pack_count]
     if q and q.strip():
         term = q.strip().lower()
@@ -587,7 +592,7 @@ def deals(
             select(Product).where(
                 Product.is_active.is_(True),
                 Product.category == "energy",
-                Product.status != "rejected",
+                Product.status == "verified",
             )
         )
     )
@@ -659,13 +664,19 @@ def catalogue(response: Response, request: Request, session: Session = Depends(g
 
     products = list(
         session.scalars(
-            select(Product).where(Product.is_active.is_(True), Product.status != "rejected")
+            select(Product).where(
+                Product.is_active.is_(True), Product.status == "verified"
+            )
         )
     )
     barcodes = {
         code: slug
         for code, slug in session.execute(
-            select(Barcode.barcode, Product.slug).join(Product, Product.id == Barcode.product_id)
+            select(Barcode.barcode, Product.slug)
+            .join(Product, Product.id == Barcode.product_id)
+            # The map must not resolve a code to a can the list above omitted;
+            # a pending product's barcode would otherwise still be pickable.
+            .where(Product.status == "verified")
         )
     }
     payload = CatalogueOut(
@@ -762,7 +773,7 @@ def compare(
 _WIDGET_MAX_AGE_SECONDS = 300
 # Bump when the validator's inputs change, so a validator handed out by an older
 # build cannot be replayed against the new one.
-_WIDGET_ETAG_VERSION = "w1"
+_WIDGET_ETAG_VERSION = "w2"
 
 
 def _freshest(current: datetime | None, candidate: datetime) -> datetime:
@@ -854,7 +865,11 @@ def widget(
             session.scalars(
                 select(Product)
                 .join(popularity, popularity.c.product_id == Product.id)
-                .where(Product.is_active.is_(True), Product.category == "energy")
+                .where(
+                    Product.is_active.is_(True),
+                    Product.category == "energy",
+                    Product.status == "verified",
+                )
                 .order_by(popularity.c.stores.desc(), Product.brand, Product.name)
                 .limit(60)
             )
@@ -892,6 +907,7 @@ def widget(
                 distance_km=best.distance_km,
                 promo=best.promo_kind,
                 source=best.source,
+                price_scope=best.price_scope,
                 age_hours=best.age_hours,
             )
         )
@@ -901,17 +917,22 @@ def widget(
     if suggest > 0 and items:
         wanted = {product.id for product in catalogue}
         wanted_brands = {product.brand.lower() for product in catalogue}
+        # No alphabetical cut-off: the old order_by(brand, name).limit(60) pool
+        # ended inside the M's, so whole brands (Rockstar, V) could never be
+        # suggested however fresh their prices were. Price the active catalogue
+        # in the one batched lookup - its cost does not follow the candidate
+        # count - then keep only the drinks that actually have a fresh offer at
+        # a scanned store, which is the pool the ranking below wants.
         candidates = list(
             session.scalars(
                 select(Product)
                 .where(
                     Product.is_active.is_(True),
                     Product.category == "energy",
-                    Product.status != "rejected",
+                    Product.status == "verified",
                     ~Product.id.in_(wanted),
                 )
                 .order_by(Product.brand, Product.name)
-                .limit(60)
             )
         )
         ranked = []
@@ -938,6 +959,7 @@ def widget(
                     distance_km=best.distance_km,
                     promo=best.promo_kind,
                     source=best.source,
+                    price_scope=best.price_scope,
                     age_hours=best.age_hours,
                     suggested=True,
                 )
@@ -959,10 +981,24 @@ def observations(
     product: str | None = None,
     store_id: int | None = None,
     source: str | None = Query(default=None, pattern="^(scrape|crowd)$"),
+    include_flagged: bool = Query(
+        default=False,
+        description="also return needs_review rows, each carrying its status",
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     session: Session = Depends(get_session),
 ) -> list[dict]:
-    stmt = select(Observation).where(Observation.status != "rejected")
+    """The recent-sightings feed the app renders.
+
+    Only accepted rows by default. A ``needs_review`` outlier is a price every
+    price endpoint refuses to quote, so serving it here made the feed read as an
+    ordinary sighting - the live case was a $500.00 crowd row with
+    ``offers: []`` on /v1/prices. Each row now carries ``status``, and a client
+    that wants to badge quarantined rows can ask for them with
+    ``include_flagged``.
+    """
+    statuses = ["accepted", "needs_review"] if include_flagged else ["accepted"]
+    stmt = select(Observation).where(Observation.status.in_(statuses))
     if product:
         found = get_product_by_slug(session, product)
         stmt = stmt.where(Observation.product_id == found.id)
@@ -980,6 +1016,15 @@ def observations(
     product_ids = {r.product_id for r, _ in folded}
     stores = {s.id: s for s in session.scalars(select(Store).where(Store.id.in_(store_ids)))}
     prods = {p.id: p for p in session.scalars(select(Product).where(Product.id.in_(product_ids)))}
+    photo_ids = {r.photo_id for r, _ in folded if r.photo_id is not None}
+    photos = (
+        {
+            photo.id: photo
+            for photo in session.scalars(select(Photo).where(Photo.id.in_(photo_ids)))
+        }
+        if photo_ids
+        else {}
+    )
     return [
         {
             "id": row.id,
@@ -996,8 +1041,17 @@ def observations(
             "in_stock": row.in_stock,
             "source": row.source,
             "price_scope": row.price_scope,
+            "status": row.status,
             "observed_at": row.observed_at,
             "note": row.note,
+            # The sighting's evidence, so the feed can show the shelf tag the
+            # price came from. Legacy rows may carry only a free-form URL.
+            "photo_token": photos[row.photo_id].token if row.photo_id in photos else None,
+            "photo_url": (
+                photo_url(photos[row.photo_id].token)
+                if row.photo_id in photos
+                else row.photo_url
+            ),
             "sightings": sightings,
         }
         for row, sightings in folded

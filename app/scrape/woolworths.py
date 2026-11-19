@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models import Listing, Product, Store
 from .base import HttpClient, ScrapeStats, chain_by_code, record_price
+from .gtin import enrich_listing, parse_woolworths_detail
 from .normalize import detect_brand, is_energy_item, parse_pack
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ log = logging.getLogger(__name__)
 CHAIN_CODE = "woolworths"
 BASE_URL = "https://www.woolworths.com.au"
 SEARCH_URL = BASE_URL + "/apis/ui/Search/products"
+DETAIL_URL = BASE_URL + "/apis/ui/product/detail/{stockcode}"
 
 DEFAULT_KEYWORDS = (
     "monster energy",
@@ -84,6 +86,23 @@ def search(
     return flattened
 
 
+def fetch_barcode(client: HttpClient, stockcode: str) -> str | None:
+    """Read the GTIN the search payload leaves empty.
+
+    ``/apis/ui/Search/products`` includes a Barcode key that is null on every
+    tile; the detail response behind the product page is the only place the
+    printed code appears.
+    """
+    response = client.get(
+        DETAIL_URL.format(stockcode=stockcode),
+        headers={
+            "Accept": "application/json",
+            "Referer": f"{BASE_URL}/shop/productdetails/{stockcode}",
+        },
+    )
+    return parse_woolworths_detail(response.json())
+
+
 def _upsert_listing(session: Session, chain_id: int, raw: dict, product: Product, pack_count: int) -> Listing:
     from datetime import datetime, timezone
 
@@ -103,6 +122,17 @@ def _upsert_listing(session: Session, chain_id: int, raw: dict, product: Product
     listing.last_seen_at = datetime.now(timezone.utc)
     session.flush()
     return listing
+
+
+def _pack_text(raw: dict, name: str) -> str:
+    """The fields that say how much is in the SKU, read as one string.
+
+    PackageSize alone is not enough: for a multipack it is the carton total
+    ("6000ML" for 24 x 250mL), and for some listings it names no size at all
+    ("4 Pack"). The can size lives in the product name, so the two are parsed
+    together or a carton is stored as one very expensive can.
+    """
+    return f"{raw.get('PackageSize') or ''} {name}".strip()
 
 
 def scrape(
@@ -129,6 +159,7 @@ def scrape(
             "woolworths: WOOLWORTHS_STORE_ID/WOOLWORTHS_SETTLEMENT unset; prices are "
             "unscoped and may reflect another state's catalogue"
         )
+    barcode_budget = settings.barcode_lookup_limit
     with HttpClient(browser=True, min_interval=1.2) as client:
         prime_session(client)
         for term in keywords or DEFAULT_KEYWORDS:
@@ -150,7 +181,7 @@ def scrape(
                 price_cents = round(float(price_dollars) * 100)
                 was_price = raw.get("WasPrice")
                 was_cents = round(float(was_price) * 100) if was_price else None
-                size_ml, pack_count = parse_pack(raw.get("PackageSize") or name)
+                size_ml, pack_count = parse_pack(_pack_text(raw, name))
                 if not is_energy_item(name, None, size_ml):
                     continue
                 product, created = match_product_woolworths(
@@ -162,6 +193,22 @@ def scrape(
                 if product is None:
                     continue
                 listing = _upsert_listing(session, chain.id, raw, product, pack_count)
+                had_barcode = bool(listing.barcode)
+                try:
+                    code, barcode_budget = enrich_listing(
+                        session,
+                        listing,
+                        product,
+                        chain=CHAIN_CODE,
+                        source="woolworths-detail",
+                        budget=barcode_budget,
+                        fetch=lambda sku: fetch_barcode(client, sku),
+                    )
+                except Exception as exc:  # network: retry next run, do not memoise
+                    log.warning("woolworths barcode %s: %s", listing.external_sku, exc)
+                else:
+                    if code and not had_barcode:
+                        stats.barcodes_found += 1
                 promo_kind = "special" if raw.get("IsSpecial") or (was_cents and was_cents > price_cents) else "none"
                 if record_price(
                     session,

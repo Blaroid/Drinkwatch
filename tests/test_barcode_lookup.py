@@ -10,13 +10,14 @@ product route and 422'd on the submission route.
 from __future__ import annotations
 
 import itertools
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -26,11 +27,13 @@ from app.db import get_session
 from app.models import (
     Base,
     Barcode,
+    CaffeineReference,
     Chain,
     Device,
     Listing,
     Observation,
     ObservationVote,
+    Photo,
     Product,
     Store,
 )
@@ -64,6 +67,8 @@ TABLES = (
     Device.__table__,
     Observation.__table__,
     ObservationVote.__table__,
+    Photo.__table__,
+    CaffeineReference.__table__,
 )
 
 
@@ -163,6 +168,13 @@ def client(
     monkeypatch.setattr(
         crowd_api, "current_device", lambda authorization, *, session: device
     )
+    monkeypatch.setattr(
+        barcode, "current_device", lambda authorization, *, session: device
+    )
+    # The pending flow indexes codes with a Postgres-only upsert and reads a
+    # cached Open Food Facts payload from a JSONB table; neither is under test.
+    monkeypatch.setattr(barcode, "register_barcode", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(barcode, "_cached_caffeine", lambda *args, **kwargs: None)
 
     app = FastAPI()
     app.include_router(public.router)
@@ -240,3 +252,98 @@ def test_a_code_with_no_canonical_form_does_not_borrow_an_unbackfilled_product(
     assert response.status_code == 200
     assert response.json()["found"] is False
     assert client.get("/v1/products/barcode/29300675001234").status_code == 404
+
+
+def _photo(
+    session: Session,
+    photo_id: int,
+    token: str,
+    *,
+    uploaded_by: int,
+    pruned_at: datetime | None = None,
+) -> Photo:
+    photo = Photo(
+        id=photo_id,
+        token=token,
+        filename=f"2026/11/{token}.jpg",
+        content_type="image/jpeg",
+        bytes=10,
+        sha256=f"{photo_id:064d}",
+        uploaded_by=uploaded_by,
+        pruned_at=pruned_at,
+    )
+    session.add(photo)
+    session.flush()
+    return photo
+
+
+def _pending_payload(store_id: int, token: str) -> dict:
+    # A valid check digit: this flow refuses a code that could otherwise become
+    # a permanent binding, so a fixture with a bad digit fails before the photo
+    # checks these tests are about.
+    return {
+        "barcode": "9300633099992",
+        "name": "Photo Test 500mL",
+        "brand": "Monster",
+        "size_ml": 500,
+        "store_id": store_id,
+        "price_cents": 399,
+        "photo_token": token,
+    }
+
+
+def test_pending_product_attaches_the_uploaders_own_photo(
+    client: TestClient, catalogue: SimpleNamespace, session: Session
+) -> None:
+    device = session.scalar(select(Device))
+    photo = _photo(session, 1, "own-tag", uploaded_by=device.id)
+
+    response = client.post(
+        "/v1/products/pending",
+        json=_pending_payload(catalogue.store.id, photo.token),
+        headers={"Authorization": "Bearer scanned"},
+    )
+
+    assert response.status_code == 201, response.text
+    observation = session.get(Observation, response.json()["observation_id"])
+    assert observation.photo_id == photo.id
+
+
+def test_pending_product_refuses_another_devices_photo(
+    client: TestClient, catalogue: SimpleNamespace, session: Session
+) -> None:
+    other = Device(token_hash="other-device")
+    session.add(other)
+    session.flush()
+    photo = _photo(session, 2, "someone-elses", uploaded_by=other.id)
+
+    response = client.post(
+        "/v1/products/pending",
+        json=_pending_payload(catalogue.store.id, photo.token),
+        headers={"Authorization": "Bearer scanned"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown photo token"
+
+
+def test_pending_product_refuses_a_pruned_photo(
+    client: TestClient, catalogue: SimpleNamespace, session: Session
+) -> None:
+    device = session.scalar(select(Device))
+    photo = _photo(
+        session,
+        3,
+        "pruned",
+        uploaded_by=device.id,
+        pruned_at=datetime.now(timezone.utc),
+    )
+
+    response = client.post(
+        "/v1/products/pending",
+        json=_pending_payload(catalogue.store.id, photo.token),
+        headers={"Authorization": "Bearer scanned"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown photo token"
