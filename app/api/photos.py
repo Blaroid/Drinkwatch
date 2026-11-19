@@ -19,7 +19,7 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from PIL import Image
 from sqlalchemy import select
@@ -38,6 +38,15 @@ MAX_DIMENSION = 1280
 THUMB_DIMENSION = 320
 JPEG_QUALITY = 82
 THUMB_SUFFIX = "_thumb"
+
+# Starlette spools an upload to disk past 1 MB but hands the handler a plain file, so the
+# read itself decides how much RAM one request may cost. 64 KiB is one read syscall's
+# worth on a spooled file and small enough that an oversized body is abandoned early.
+UPLOAD_CHUNK_BYTES = 64 * 1024
+# Content-Length covers the multipart boundaries and part headers as well as the image,
+# so an upload of exactly PHOTOS_MAX_BYTES is slightly larger on the wire. Allow for that
+# rather than refusing a legitimate file on the header alone.
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
 def photos_root() -> Path:
@@ -76,6 +85,44 @@ def photo_out(photo: Photo) -> PhotoOut:
         height=photo.height,
         created_at=photo.created_at,
     )
+
+
+def reject_oversized_declaration(request: Request, limit: int) -> None:
+    """Refuse a body that Content-Length already says is too large.
+
+    FastAPI has received the body into the UploadFile spool file before the handler
+    runs, so this saves the in-memory read and the Pillow decode rather than the
+    receipt itself. A missing or malformed header is left to the streaming check.
+    """
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return
+    try:
+        length = int(declared)
+    except ValueError:
+        return
+    if length > limit + MULTIPART_OVERHEAD_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "image too large")
+
+
+def read_upload(file: UploadFile, limit: int) -> tuple[bytes, str]:
+    """Read an upload up to `limit` bytes, hashing as it streams.
+
+    Returns the bytes and their sha256 digest. The size check sits between chunks, so an
+    oversized body costs at most one chunk past the limit in memory instead of its full
+    length; the digest is taken here so the dedupe lookup needs no second pass.
+    """
+    buffer = bytearray()
+    digest = hashlib.sha256()
+    while True:
+        chunk = file.file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        if len(buffer) + len(chunk) > limit:
+            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "image too large")
+        buffer.extend(chunk)
+        digest.update(chunk)
+    return bytes(buffer), digest.hexdigest()
 
 
 def decode_image(raw: bytes) -> Image.Image:
@@ -161,6 +208,7 @@ def serve(path: Path, media_type: str = "image/jpeg") -> FileResponse:
 
 @router.post("/photos", response_model=PhotoOut, status_code=status.HTTP_201_CREATED)
 def upload_photo(
+    request: Request,
     file: UploadFile = File(...),
     authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
@@ -168,13 +216,12 @@ def upload_photo(
     device = current_device(authorization, session=session)
     write_limiter.check(f"photo:{device.id}")
 
-    raw = file.file.read()
+    limit = settings.photos_max_bytes
+    reject_oversized_declaration(request, limit)
+    raw, digest = read_upload(file, limit)
     if not raw:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "empty upload")
-    if len(raw) > settings.photos_max_bytes:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "image too large")
 
-    digest = hashlib.sha256(raw).hexdigest()
     existing = session.scalar(
         select(Photo).where(
             Photo.sha256 == digest,

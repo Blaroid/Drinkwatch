@@ -6,16 +6,19 @@ one-method stub keeps these runnable with plain `python -m pytest`.
 
 from __future__ import annotations
 
+import hashlib
 import io
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from PIL import Image
+from starlette.requests import Request
 
 from app.api import photos
-from app.models import Photo
+from app.models import Device, Photo
 
 
 class StubSession:
@@ -26,6 +29,54 @@ class StubSession:
 
     def scalar(self, _statement: object) -> Photo | None:
         return self.photo
+
+
+class UploadSession:
+    """Session stub good enough for one upload: a device, and no duplicate photo.
+
+    `add` fills in what a flush would give the row, so `photo_out` can serialise it.
+    """
+
+    def __init__(self, device: Device) -> None:
+        self.device = device
+        self.added: list[Photo] = []
+        self.commits = 0
+
+    def scalar(self, statement: object) -> Device | None:
+        entity = statement.column_descriptions[0]["entity"]  # type: ignore[attr-defined]
+        return self.device if entity is Device else None
+
+    def add(self, photo: Photo) -> None:
+        photo.id = 1
+        photo.created_at = datetime.now(timezone.utc)
+        self.added.append(photo)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+
+class CountingFile(io.BytesIO):
+    """File object that records how many bytes the handler actually consumed."""
+
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.consumed = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = super().read(size)
+        self.consumed += len(chunk)
+        return chunk
+
+
+def counting_upload(payload: bytes) -> tuple[UploadFile, CountingFile]:
+    reader = CountingFile(payload)
+    return UploadFile(file=reader, filename="tag.jpg"), reader
+
+
+def upload_request(content_length: int | None = None) -> Request:
+    """Request carrying only the headers the upload handler looks at."""
+    headers = [] if content_length is None else [(b"content-length", str(content_length).encode())]
+    return Request({"type": "http", "headers": headers})
 
 
 def jpeg_bytes(width: int, height: int, with_exif: bool = False) -> bytes:
@@ -113,6 +164,118 @@ def test_pruned_photo_is_gone_rather_than_missing(photo_dir: Path) -> None:
     with pytest.raises(HTTPException) as excinfo:
         photos.get_photo("nope", session=StubSession(None))
     assert excinfo.value.status_code == 404
+
+
+@pytest.fixture()
+def quiet_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real limiter is process-wide; one test must not spend another's budget.
+    monkeypatch.setattr(photos.write_limiter, "check", lambda _key: None)
+
+
+def with_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
+    monkeypatch.setattr(photos, "settings", replace(photos.settings, photos_max_bytes=limit))
+
+
+def upload(
+    request: Request,
+    file: UploadFile,
+    session: UploadSession,
+) -> photos.PhotoOut:
+    return photos.upload_photo(request, file, authorization="Bearer tok", session=session)
+
+
+def test_oversized_upload_stops_reading_one_chunk_past_the_limit(
+    photo_dir: Path,
+    quiet_limiter: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 4096
+    with_limit(monkeypatch, limit)
+    # never decoded: the 413 fires before Pillow gets a look at it
+    file, reader = counting_upload(b"\xff" * (limit * 4))
+    session = UploadSession(Device(id=7))
+
+    with pytest.raises(HTTPException) as excinfo:
+        upload(upload_request(), file, session)
+
+    assert excinfo.value.status_code == 413
+    assert reader.consumed <= limit + photos.UPLOAD_CHUNK_BYTES
+    assert session.added == []
+    assert list(photo_dir.rglob("*.jpg")) == []
+
+
+def test_upload_rejects_an_oversized_content_length_without_reading(
+    quiet_limiter: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 4096
+    with_limit(monkeypatch, limit)
+    # the declared size is what a hostile client would send; the body stays tiny so the
+    # test cannot itself read gigabytes
+    file, reader = counting_upload(jpeg_bytes(64, 64))
+
+    with pytest.raises(HTTPException) as excinfo:
+        upload(upload_request(content_length=limit * 1024), file, UploadSession(Device(id=8)))
+
+    assert excinfo.value.status_code == 413
+    assert reader.consumed == 0
+
+
+def test_a_content_length_at_the_limit_still_reads(
+    photo_dir: Path,
+    quiet_limiter: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = jpeg_bytes(64, 64)
+    with_limit(monkeypatch, len(payload))
+    file, reader = counting_upload(payload)
+
+    # multipart framing makes the body a little larger than the image it carries
+    out = upload(
+        upload_request(content_length=len(payload) + 512), file, UploadSession(Device(id=9))
+    )
+
+    assert out.bytes > 0
+    assert reader.consumed == len(payload)
+
+
+def test_upload_writes_the_full_copy_and_thumbnail(
+    photo_dir: Path,
+    quiet_limiter: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = jpeg_bytes(3000, 2000)
+    with_limit(monkeypatch, 2 * 1024 * 1024)
+    file, reader = counting_upload(payload)
+    session = UploadSession(Device(id=10))
+
+    out = upload(upload_request(), file, session)
+
+    photo = session.added[0]
+    full_path = photo_dir / photo.filename
+    thumb_path = photo_dir / photos.thumb_filename(photo.filename)
+    assert max(Image.open(full_path).size) == photos.MAX_DIMENSION
+    assert max(Image.open(thumb_path).size) == photos.THUMB_DIMENSION
+    # the digest is taken while streaming and has to match the bytes that were stored
+    assert photo.sha256 == hashlib.sha256(payload).hexdigest()
+    assert photo.bytes == full_path.stat().st_size
+    assert out.bytes == photo.bytes
+    assert out.thumb_url.endswith(f"/v1/photos/{photo.token}/thumb")
+    assert reader.consumed == len(payload)
+    assert session.commits == 1
+
+
+def test_empty_upload_is_rejected(
+    quiet_limiter: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with_limit(monkeypatch, 4096)
+    file, _reader = counting_upload(b"")
+
+    with pytest.raises(HTTPException) as excinfo:
+        upload(upload_request(content_length=0), file, UploadSession(Device(id=11)))
+
+    assert excinfo.value.status_code == 422
 
 
 def test_photo_out_advertises_the_thumbnail_url() -> None:
