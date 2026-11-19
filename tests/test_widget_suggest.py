@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import public
+from app.api.deps import _freshest
 from app.models import Base, Chain, Observation, Product, Store
 from app.schemas import OfferOut
 
@@ -245,8 +246,9 @@ def test_suggest_attributes_chain_prices_and_prefers_a_store_row(
         "woolworths",
         2.5,
     )
-    # latest_prices() lets the store's own row win over a chain-wide one, so the
-    # $2.40 online price for SpudShed does not become the shelf price.
+    # Equal observation times, and latest_prices() breaks that tie in favour of
+    # the row seen on the shelf, so the $2.40 online price for SpudShed does not
+    # become the shelf price.
     shelf = body["items"][2]
     assert (shelf["slug"], shelf["price_cents"], shelf["store"]) == (
         "spud-shelf",
@@ -278,6 +280,61 @@ def test_suggest_reads_the_alias_group_and_the_newest_row(
     assert (suggestion["slug"], suggestion["label"]) == ("v-sugarfree", "V Sugarfree 500ml")
     assert suggestion["price_cents"] == 280
     assert suggestion["age_hours"] == pytest.approx(1.0, abs=0.1)
+
+
+def test_suggest_quotes_the_scope_latest_prices_would_pick(db: tuple[Engine, Session]) -> None:
+    """Regression: a stale store row must not shadow a fresher chain scrape.
+
+    ``_offers_for_product()`` renders ``latest_prices()``, which keeps whichever
+    scope was observed more recently. The batched reduce used to keep the store
+    row whenever one existed, so a 71-hour-old $3.90 crowd sighting became the
+    suggestion while the tracked row for the same drink showed $3.10.
+    """
+    _engine, session = db
+    _seed(session)
+    _product(session, 1, "monster-ultra", "Monster", "Ultra")
+    _product(session, 2, "v-sugarfree", "V", "Sugarfree")
+    _obs(session, 100, product_id=2, store_id=1, price_cents=390, hours_ago=71)
+    _obs(session, 101, product_id=2, chain_id=1, price_cents=310, hours_ago=8)
+    session.commit()
+
+    product = session.scalars(select(Product).where(Product.id == 2)).one()
+    suggestion = public._suggest_offers(
+        session, [product], _store_distances(session), NOW - timedelta(hours=72)
+    )[2]
+
+    # What the single-product path picks for this store, straight from the rule
+    # it applies (latest_prices() is Postgres-only SQL and cannot run here).
+    expected = _freshest(session.get(Observation, 100), session.get(Observation, 101), 1)
+    assert expected is not None
+    assert (suggestion.price_cents, suggestion.price_scope) == (
+        expected.primary.price_cents,
+        expected.primary.price_scope,
+    )
+    assert (suggestion.price_cents, suggestion.price_scope) == (310, "chain")
+    # The chain row carries no store_id of its own; the offer must be stamped
+    # with the shop it is attributed to.
+    assert suggestion.store_id == 1
+
+
+def test_suggest_keeps_a_store_row_observed_later_than_the_chain_row(
+    db: tuple[Engine, Session],
+) -> None:
+    """Freshest still wins the other way: a newer shelf sighting beats the proxy."""
+    _engine, session = db
+    _seed(session)
+    _product(session, 1, "monster-ultra", "Monster", "Ultra")
+    _product(session, 2, "spud-shelf", "SpudShed", "Shelf")
+    _obs(session, 100, product_id=2, store_id=1, price_cents=250, hours_ago=1)
+    _obs(session, 101, product_id=2, chain_id=1, price_cents=240, hours_ago=6)
+    session.commit()
+
+    product = session.scalars(select(Product).where(Product.id == 2)).one()
+    suggestion = public._suggest_offers(
+        session, [product], _store_distances(session), NOW - timedelta(hours=72)
+    )[2]
+
+    assert (suggestion.price_cents, suggestion.price_scope) == (250, "store")
 
 
 def test_suggest_price_lookup_is_two_queries_however_many_candidates(
