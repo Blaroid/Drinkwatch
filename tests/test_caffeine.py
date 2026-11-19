@@ -6,6 +6,7 @@ venv has pytest.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.caffeine import (
@@ -26,7 +27,9 @@ class _StubSession:
     def scalar(self, _statement: object) -> object | None:
         if self._payload is None:
             return None
-        return SimpleNamespace(payload=self._payload)
+        # _cached() also reads the row's age: a cached answer is only served
+        # inside OFF_TTL, so the stub has to carry a timestamp like the model.
+        return SimpleNamespace(payload=self._payload, created_at=datetime.now(timezone.utc))
 
 
 def _row(brand: str, flavour: str, mg: float = 32.0) -> CaffeineReference:

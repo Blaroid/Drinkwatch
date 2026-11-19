@@ -13,14 +13,14 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..caffeine import caffeine_from_off, plausible_caffeine
 from ..config import settings
 from ..db import get_session
-from ..models import BarcodeCache, Device, Observation, Store
+from ..models import Barcode, BarcodeCache, Device, Listing, Observation, Product, Store
 from ..schemas import BarcodeLookupOut, PendingProductIn, PendingProductOut, ProductOut
 from ..scrape.normalize import (
     barcode_variants,
@@ -30,7 +30,7 @@ from ..scrape.normalize import (
     parse_pack,
     register_barcode,
 )
-from ..security import current_device, read_limiter, write_limiter
+from ..security import client_ip, current_device, read_limiter, write_limiter
 from .deps import find_product_by_barcode
 
 log = logging.getLogger(__name__)
@@ -42,10 +42,25 @@ OFF_FIELDS = "product_name,brands,quantity,caffeine_100g,image_front_url"
 OFF_TTL = timedelta(days=30)
 
 
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 def _cached(session: Session, barcode: str) -> dict | None:
+    """The cached payload for a code, or None when it is missing or stale.
+
+    The TTL is what makes a wrong answer survivable: Open Food Facts can answer
+    "not found" for a code it has not imported yet, and one bad hour must not
+    pin that barcode as unknown for the life of the database. A stale row is
+    left where it is - the next successful lookup overwrites it.
+    """
     row = session.scalar(select(BarcodeCache).where(BarcodeCache.barcode == barcode))
     if row is None:
         return None
+    if row.created_at is not None:
+        age = datetime.now(timezone.utc) - _as_utc(row.created_at)
+        if age >= OFF_TTL:
+            return None
     return row.payload
 
 
@@ -75,12 +90,20 @@ def _cached_caffeine(session: Session, barcode: str) -> float | None:
 
 
 def external_lookup(session: Session, barcode: str) -> dict | None:
-    """Open Food Facts fallback, cached (including negative results)."""
+    """Open Food Facts suggestion for a code, or None when there is none.
+
+    Only a successful answer is cached, negatives included: a 429 or a 500 is
+    our problem, not evidence about the barcode, and caching it would report
+    that code as unknown until OFF_TTL expired. A negative that Open Food Facts
+    really did answer is worth keeping - a known-unknown saves a request per
+    scan - but it is returned as None, because ``{"found": false}`` was being
+    handed to clients as a truthy suggestion.
+    """
     if not settings.off_lookup_enabled:
         return None
     cached = _cached(session, barcode)
     if cached is not None:
-        return cached or None
+        return cached if cached.get("found") else None
     try:
         with httpx.Client(timeout=6.0, headers={"User-Agent": settings.scrape_user_agent}) as client:
             response = client.get(OFF_URL.format(barcode=barcode), params={"fields": OFF_FIELDS})
@@ -89,7 +112,7 @@ def external_lookup(session: Session, barcode: str) -> dict | None:
         return None
 
     if response.status_code != 200:
-        _cache(session, barcode, {"source": "openfoodfacts", "found": False})
+        log.info("openfoodfacts lookup for %s returned HTTP %s", barcode, response.status_code)
         return None
     try:
         payload = response.json()
@@ -115,7 +138,12 @@ def external_lookup(session: Session, barcode: str) -> dict | None:
 
 
 @router.get("/barcode/{barcode}", response_model=BarcodeLookupOut, summary="Resolve a scanned barcode")
-def lookup(barcode: str, session: Session = Depends(get_session)) -> BarcodeLookupOut:
+def lookup(
+    barcode: str, request: Request, session: Session = Depends(get_session)
+) -> BarcodeLookupOut:
+    # This route was the one free read: every call may reach Open Food Facts, so
+    # one scanner could spend the third party's quota for everybody.
+    read_limiter.check("barcode:" + client_ip(request))
     normalised = normalize_barcode(barcode)
     # A GTIN-14's check digit covers its packaging indicator, so validate every form.
     checksum_ok = any(ean13_checksum_ok(variant) for variant in barcode_variants(barcode))
@@ -140,6 +168,47 @@ def lookup(barcode: str, session: Session = Depends(get_session)) -> BarcodeLook
             "No match. Ask the user for the name and size on the can, then POST /v1/products/pending"
         ),
     )
+
+
+def _published_by_retailer(session: Session, raw: str, normalised: str | None) -> bool:
+    """Whether a chain itself published this code, so a bad check digit is expected.
+
+    Woolworths hands out GTIN-14 codes whose check digit does not survive
+    folding to EAN-13, and some chains invent internal codes that are not GTINs
+    at all (``barcode_variants`` deliberately keeps those forms). A code we have
+    only ever seen from a scan has no such excuse.
+    """
+    forms = barcode_variants(raw) + ([normalised] if normalised else [])
+    if not forms:
+        return False
+    listing = session.scalar(select(Listing.id).where(Listing.barcode.in_(forms)).limit(1))
+    if listing is not None:
+        return True
+    product = session.scalar(select(Product.id).where(Product.barcode.in_(forms)).limit(1))
+    return product is not None
+
+
+def _code_can_be_indexed(session: Session, raw: str, normalised: str | None) -> bool:
+    """Whether a scan is trustworthy enough to become a permanent binding."""
+    if any(ean13_checksum_ok(variant) for variant in barcode_variants(raw)):
+        return True
+    return _published_by_retailer(session, raw, normalised)
+
+
+def _index_crowd_code(session: Session, product: Product, raw: str) -> None:
+    """Index the code this request created ``product`` with, as a crowd binding.
+
+    match_product() already registered every form as "scrape" while it created
+    the row; the code came from a device, and /v1/admin/barcodes uses source to
+    tell the crowd's bindings from the chains'.
+    """
+    register_barcode(session, product.id, raw, source="crowd")
+    for row in session.scalars(
+        select(Barcode).where(
+            Barcode.product_id == product.id, Barcode.barcode.in_(barcode_variants(raw))
+        )
+    ):
+        row.source = "crowd"
 
 
 @router.post(
@@ -170,6 +239,13 @@ def submit_pending(
     product = find_product_by_barcode(session, payload.barcode, normalised)
 
     if product is None:
+        # The code is about to become permanent, so a misread has to be refused
+        # here: a wrong check digit is far more likely than a new retailer form.
+        if not _code_can_be_indexed(session, payload.barcode, normalised):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "barcode check digit is invalid; rescan the code",
+            )
         size_ml = payload.size_ml
         pack_count = payload.pack_count
         if size_ml is None:
@@ -194,11 +270,13 @@ def submit_pending(
             product.source = "crowd"
             product.status = "pending"
 
-    # Index every code form against the product (and fill the primary column).
-    register_barcode(session, product.id, payload.barcode, source="crowd")
-    if normalised and not product.normalised_barcode:
-        product.normalised_barcode = normalised
-        product.barcode = product.barcode or payload.barcode
+    # Only a submission that created the product may add a code to the index.
+    # Indexing a code against a product that already existed let any device
+    # attach arbitrary (or misread) codes to a known can, and register_barcode()
+    # never overwrites, so the mistake was permanent. Correcting such a binding
+    # is now a moderator action: POST/DELETE /v1/admin/barcodes.
+    if created:
+        _index_crowd_code(session, product, payload.barcode)
 
     # The barcode lookup already paid for Open Food Facts; persist the label
     # figure it returned instead of discarding it with the suggestion. Curated

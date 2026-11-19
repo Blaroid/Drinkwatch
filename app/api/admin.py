@@ -12,7 +12,17 @@ from sqlalchemy.orm import Session
 from ..caffeine import apply_reference_caffeine
 from ..daily import sync_daily_price
 from ..db import get_session
-from ..models import Chain, Device, Listing, Observation, Product, Report, ScrapeRun, Store
+from ..models import (
+    Barcode,
+    Chain,
+    Device,
+    Listing,
+    Observation,
+    Product,
+    Report,
+    ScrapeRun,
+    Store,
+)
 from ..security import require_admin
 from .deps import utcnow
 
@@ -191,6 +201,196 @@ def map_listing(
     listing.product_id = product.id
     session.commit()
     return {"listing_id": listing.id, "product_id": product.id, "product_slug": product.slug}
+
+
+def _code_forms(raw: str) -> list[str]:
+    """Every key one physical code can occupy in the barcodes index.
+
+    deps.find_product_by_barcode() accepts whichever form a client scanned, so
+    a moderator acting on one form has to see the code's other forms too.
+    """
+    from ..scrape.normalize import barcode_variants
+
+    return barcode_variants(raw) or [raw]
+
+
+def _release_product_code(product: Product | None, forms: list[str]) -> list[str]:
+    """Clear a product's own barcode columns when they name one of ``forms``.
+
+    products.barcode and products.normalised_barcode resolve a scan on their
+    own, so a binding removed from the index would keep working through them.
+    """
+    if product is None:
+        return []
+    released = []
+    if product.barcode in forms:
+        product.barcode = None
+        released.append("barcode")
+    if product.normalised_barcode in forms:
+        product.normalised_barcode = None
+        released.append("normalised_barcode")
+    return released
+
+
+def _other_claimants(session: Session, product_id: int, forms: list[str]) -> list[Product]:
+    """Products whose own barcode columns resolve one of ``forms``.
+
+    Both products.barcode and products.normalised_barcode win a scan without the
+    barcodes table, so a moderator acting on a code has to account for them too.
+    """
+    return list(
+        session.scalars(
+            select(Product).where(
+                Product.id != product_id,
+                (Product.barcode.in_(forms)) | (Product.normalised_barcode.in_(forms)),
+            )
+        )
+    )
+
+
+def _claim_product_code(session: Session, product: Product, raw: str) -> bool:
+    """Make a mapped code the product's own code when nobody else claims it.
+
+    Writing the columns while another product still resolves the same code would
+    leave a scan with two answers, so the index rows alone carry the mapping
+    until the conflict is resolved.
+    """
+    from ..scrape.normalize import normalize_barcode
+
+    forms = _code_forms(raw)
+    if _other_claimants(session, product.id, forms):
+        return False
+    changed = False
+    normalised = normalize_barcode(raw)
+    if normalised and not product.normalised_barcode:
+        product.normalised_barcode = normalised
+        changed = True
+    if not product.barcode:
+        product.barcode = raw
+        changed = True
+    return changed
+
+
+class BarcodeMapRequest(BaseModel):
+    product_slug: str = Field(max_length=160)
+
+
+@router.get("/barcodes", summary="Barcode index rows, newest first")
+def barcodes(
+    product_slug: str | None = None,
+    source: str | None = Query(default=None, description="scrape | crowd | admin"),
+    barcode: str | None = Query(default=None, description="any form of one physical code"),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    stmt = (
+        select(Barcode, Product)
+        .join(Product, Product.id == Barcode.product_id)
+        .order_by(Barcode.created_at.desc(), Barcode.barcode)
+        .limit(limit)
+    )
+    if product_slug:
+        stmt = stmt.where(Product.slug == product_slug)
+    if source:
+        stmt = stmt.where(Barcode.source == source)
+    if barcode:
+        stmt = stmt.where(Barcode.barcode.in_(_code_forms(barcode)))
+    return [
+        {
+            "barcode": row.barcode,
+            "product_id": product.id,
+            "product_slug": product.slug,
+            "product_label": f"{product.brand} {product.name}".strip(),
+            "product_status": product.status,
+            "source": row.source,
+            "created_at": row.created_at,
+        }
+        for row, product in session.execute(stmt)
+    ]
+
+
+@router.delete("/barcodes/{barcode}", summary="Remove a barcode binding")
+def delete_barcode(barcode: str, session: Session = Depends(get_session)) -> dict:
+    """Unbind a code so scanning it stops resolving to that product.
+
+    Every form of the code goes, because the lookup accepts whichever form the
+    client scanned: deleting one row while a sibling form survived would leave
+    the binding working. A form bound to a different product is reported and
+    left for its own decision.
+    """
+    forms = _code_forms(barcode)
+    rows = list(session.scalars(select(Barcode).where(Barcode.barcode.in_(forms))))
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown barcode")
+    target = next(
+        (row.product_id for row in rows if row.barcode == barcode), rows[0].product_id
+    )
+    removed = [row.barcode for row in rows if row.product_id == target]
+    product = session.get(Product, target)
+    released = _release_product_code(product, forms)
+    others = {row.barcode: row.product_id for row in rows if row.product_id != target}
+    # A product that carries the code in its own columns keeps resolving a scan
+    # after the index row is gone, so report it rather than leaving the moderator
+    # believing the binding is dead.
+    for holder in _other_claimants(session, target, forms):
+        for form in (holder.barcode, holder.normalised_barcode):
+            if form in forms:
+                others.setdefault(form, holder.id)
+    for row in rows:
+        if row.product_id == target:
+            session.delete(row)
+    session.commit()
+    return {
+        "barcode": barcode,
+        "removed": removed,
+        "product_slug": product.slug if product is not None else None,
+        "product_columns_cleared": released,
+        "other_products": others,
+    }
+
+
+@router.post("/barcodes/{barcode}/map", summary="Bind or move a barcode onto a product")
+def map_barcode(
+    barcode: str, payload: BarcodeMapRequest, session: Session = Depends(get_session)
+) -> dict:
+    """Point a code at a product, creating the binding if it is new.
+
+    This is the repair path for a crowd binding that landed on the wrong can, and
+    the way to add a retailer-internal code that the crowd flow refuses.
+    """
+    product = session.scalar(select(Product).where(Product.slug == payload.product_slug))
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown product")
+    forms = _code_forms(barcode)
+    # A scan resolves through the index rows and through products.barcode /
+    # normalised_barcode alike, so a move has to take the code away from every
+    # product that currently answers it - including one that only carries it in
+    # its own columns, which no barcode row would have revealed.
+    holders = set(session.scalars(select(Barcode.product_id).where(Barcode.barcode.in_(forms))))
+    holders |= {holder.id for holder in _other_claimants(session, product.id, forms)}
+    holders.discard(product.id)
+    for holder_id in sorted(holders):
+        _release_product_code(session.get(Product, holder_id), forms)
+    created: list[str] = []
+    moved: list[str] = []
+    for form in forms:
+        row = session.get(Barcode, form)
+        if row is None:
+            session.add(Barcode(barcode=form, product_id=product.id, source="admin"))
+            created.append(form)
+        elif row.product_id != product.id:
+            row.product_id = product.id
+            moved.append(form)
+    columns = _claim_product_code(session, product, barcode)
+    session.commit()
+    return {
+        "barcode": barcode,
+        "product_id": product.id,
+        "product_slug": product.slug,
+        "created": created,
+        "moved": moved,
+        "product_columns_written": columns,
+    }
 
 
 @router.get("/products/links", summary="Current cross-chain product groups")
