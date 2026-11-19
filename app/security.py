@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -55,6 +55,14 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ADMIN_TOKEN is not configured")
     if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "bad admin token")
+
+
+def client_ip(request: Request) -> str:
+    """The caller's address, honouring the proxy header the containers sit behind."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _utcnow():

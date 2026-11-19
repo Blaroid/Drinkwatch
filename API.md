@@ -164,9 +164,17 @@ Your own history and profile:
     GET  /v1/admin/products/suggestions?brand=Monster&min_score=0.34
     POST /v1/admin/observations/{id}/status {"status": "accepted|needs_review|rejected"}
     GET  /v1/admin/devices
+    GET  /v1/admin/barcodes?product_slug=&source=&barcode=
+    POST /v1/admin/barcodes/{code}/map {"product_slug": "..."}
+    DELETE /v1/admin/barcodes/{code}
 
 A status change is applied to the daily price ledger too, so approving a flagged
 price adds it to the deal history and rejecting one takes it back out.
+
+The barcode index is written by the crowd, so it needs the same moderation: map a
+code that landed on the wrong can, or delete a binding that should not exist.
+Both act on every form of the code (EAN-13, its GTIN-14, UPC-A) and on the
+product's own barcode column, because either one alone resolves a scan.
 
 ## Errors
 
@@ -197,6 +205,16 @@ retailer codes are not valid GTINs.
 Creates a `pending` product (name is required - that is the point) and optionally a
 price sighting. If the barcode already resolves, it returns that product with
 `created: false` and just attaches the price.
+
+Only a submission that created the product indexes its code: binding a code to a
+can that already existed is how a misread or a deliberate one became permanent,
+and the admin routes above are the way to correct a binding. The code also has to
+carry a valid GTIN check digit, unless a chain published it in a listing - that
+is how Woolworths' GTIN-14s and retailer-internal codes still get through.
+
+An Open Food Facts answer is cached for 30 days and then asked again, and a
+failure (429, 5xx) is not cached as "not found" at all. Both barcode routes are
+rate limited per client.
 
 ## Photos
 
