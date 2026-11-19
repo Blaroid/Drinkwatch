@@ -15,7 +15,7 @@ import pytest
 
 from app import pricing
 from app.api import basket
-from app.schemas import BasketCompareIn, BasketItemIn
+from app.schemas import BasketCompareIn, BasketItemIn, BasketLineOut
 
 ORIGIN = (-31.9523, 115.8613)
 SINGLE = SimpleNamespace(id=10, slug="monster-mango-loco-500ml")
@@ -127,10 +127,31 @@ def test_route_stop_names_the_single_it_buys(monkeypatch: pytest.MonkeyPatch):
     )
 
     item = result.stops[0].items[0]
-    assert item["cost_cents"] == 658
-    assert item["breakdown"] == ["2 x single @ $3.29"]
-    assert item["product_slug"] == SINGLE.slug
-    assert item["label"] == "Monster Mango Loco 500ml"
+    assert item.cost_cents == 658
+    assert item.breakdown == ["2 x single @ $3.29"]
+    assert item.product_slug == SINGLE.slug
+    assert item.label == "Monster Mango Loco 500ml"
+
+
+def test_route_line_is_a_basket_line(monkeypatch: pytest.MonkeyPatch):
+    """A route line must not need its own parser.
+
+    /v1/plan/route emitted ``cost`` and no ``units``/``price`` although API.md
+    promised the basket-line shape, so a client had to branch on which plan
+    endpoint a line came from. ``cost`` stays as the deprecated spelling.
+    """
+    _wire(monkeypatch)
+    compare = basket.basket_compare(_payload(2), session=None)
+    route = basket.route_plan(
+        "monster-mango-loco-500ml:2", ORIGIN[0], ORIGIN[1], None, None, session=None
+    )
+
+    basket_line = compare.stores[0].items[0]
+    route_line = route.stops[0].items[0]
+    assert isinstance(route_line, BasketLineOut)
+    assert set(route_line.model_dump()) == set(basket_line.model_dump()) | {"cost"}
+    assert (route_line.units, route_line.price) == (2, "$6.58")
+    assert route_line.cost == route_line.price == "$6.58"
 
 
 def test_basket_line_buys_the_pack_the_audit_missed(monkeypatch: pytest.MonkeyPatch):

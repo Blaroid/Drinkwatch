@@ -29,6 +29,7 @@ from ..schemas import (
     BasketStoreOut,
     BudgetItemOut,
     MaxCaffeineOut,
+    RouteLineOut,
     RoutePlanOut,
     RouteStopOut,
 )
@@ -438,19 +439,23 @@ def route_plan(
         cost, store_id, breakdown = best
         entry = stops.setdefault(store_id, {"items": [], "subtotal": 0})
         product_slug, label = _line_product(breakdown)
+        # One shape for both plan endpoints: a route line is a basket line, so
+        # `units` and `price` mean what they mean on /v1/basket/compare.
         entry["items"].append(
-            {
-                "requested": slug,
-                "quantity": quantity,
-                "product_slug": product_slug,
-                "label": label,
-                "cost_cents": cost,
-                "cost": format_cents(cost),
-                "breakdown": [
+            RouteLineOut(
+                requested=slug,
+                quantity=quantity,
+                product_slug=product_slug,
+                label=label,
+                units=sum(bundle.units * count for bundle, count in breakdown),
+                cost_cents=cost,
+                price=format_cents(cost),
+                cost=format_cents(cost),
+                breakdown=[
                     f"{count} x {bundle.label} @ {format_cents(bundle.cost_cents)}"
                     for bundle, count in breakdown
                 ],
-            }
+            )
         )
         entry["subtotal"] += cost
 

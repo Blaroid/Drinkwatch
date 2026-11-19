@@ -79,6 +79,9 @@ def test_widget_is_cacheable(monkeypatch: pytest.MonkeyPatch) -> None:
     etag = res.headers["etag"]
     assert etag.startswith('W/"') and etag.endswith('"')
     assert res.json()["items"][0]["slug"] == "monster-ultra"
+    # The app can only mark chain prices if the row says what it is; the old
+    # payload left it to guess from `source`, which is wrong for scraped shops.
+    assert res.json()["items"][0]["price_scope"] == "store"
 
 
 def test_etag_is_stable_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
