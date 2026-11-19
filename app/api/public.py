@@ -250,6 +250,12 @@ def _row_observation(row: dict) -> Observation:
     return Observation(**{key: value for key, value in row.items() if key != "rn"})
 
 
+def _row_time(row: dict) -> datetime:
+    """A batched row's timestamp in UTC, because fixtures hand us naive rows."""
+    moment: datetime = row["observed_at"]
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 def _suggest_offers(
     session: Session,
     products: list[Product],
@@ -332,21 +338,23 @@ def _suggest_offers(
     for product in products:
         root = product.canonical_product_id or product.id
         observations: dict[int, Observation] = {}
-        # Store-scoped rows first in store_id order, then the chain-wide price
-        # for stores without one: the order latest_prices() returns, which is
-        # also the tie-break the offer sort relies on. If latest_prices() ever
-        # prefers the freshest scope instead of the store row (see wt/p1b), this
-        # reduce has to follow it or suggests will disagree with the rows above.
-        for store_id, row in sorted(in_store.get(root, {}).items()):
-            observations[store_id] = _row_observation(row)
+        # Per store, whichever scope was observed more recently wins - the rule
+        # latest_prices() applies through deps._freshest(). Preferring the store
+        # row unconditionally let a three-day-old crowd sighting shadow last
+        # night's chain-wide scrape, so a suggestion could quote a different
+        # price for the same drink than the tracked row above it. Ties go to the
+        # store row, seen on that shelf rather than published for the chain.
+        own_by_store = in_store.get(root, {})
+        chain_by_chain = in_chain.get(root, {})
         for store in stores:
-            if store.id in observations:
-                continue
-            row = in_chain.get(root, {}).get(store.chain_id)
-            if row is not None:
+            own = own_by_store.get(store.id)
+            chain = chain_by_chain.get(store.chain_id)
+            if chain is not None and (own is None or _row_time(chain) > _row_time(own)):
                 observations[store.id] = _row_observation(
-                    {**row, "store_id": store.id, "price_scope": "chain"}
+                    {**chain, "store_id": store.id, "price_scope": "chain"}
                 )
+            elif own is not None:
+                observations[store.id] = _row_observation(own)
 
         winner: tuple[Store, float, Observation] | None = None
         for store_id, obs in observations.items():
