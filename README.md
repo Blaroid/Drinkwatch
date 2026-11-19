@@ -139,7 +139,9 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
   `python -m app.scrape.runner --chain spudshed` (`--list` shows what is enabled).
 * **Photos** - the api container writes `./photos` as uid 1000; a systemd user
   timer mirrors them to the redmax backup disk every 10 minutes and prunes local
-  copies after 14 days (`scripts/photos-sync.sh`).
+  copies after 14 days (`scripts/photos-sync.sh`). Before a file is removed the sync
+  script marks its `photos` row `pruned_at`, so `/v1/photos/{token}` answers 410
+  instead of pointing at a file that is no longer there.
 * **Backups** - data lives in the `drinkwatch_pgdata` volume:
   `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz`
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`

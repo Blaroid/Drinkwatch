@@ -195,13 +195,19 @@ price sighting. If the barcode already resolves, it returns that product with
     POST /v1/photos        (device auth, multipart form field "file")
 
     201 {"id": 3, "token": "tRnEh5kz...", "url": "https://.../v1/photos/tRnEh5kz...",
+         "thumb_url": "https://.../v1/photos/tRnEh5kz.../thumb",
          "content_type": "image/jpeg", "bytes": 311, "width": 64, "height": 64,
          "created_at": "..."}
 
-Max 8 MB, images only. EXIF (including GPS) is stripped by re-encoding, max
-dimension 1600 px. Same image from the same device returns the existing row.
+Max 8 MB, images only. EXIF (including GPS) is stripped by re-encoding; the stored
+copy is capped at 1280 px and a 320 px thumbnail is written next to it. Same image
+from the same device returns the existing row (unless that row was pruned).
 
-    GET /v1/photos/{token}     -> image/jpeg (immutable cache), 404 unknown, 410 file gone
+    GET /v1/photos/{token}         -> image/jpeg (immutable cache), 404 unknown, 410 gone or pruned
+    GET /v1/photos/{token}/thumb   -> image/jpeg, 320 px; backfilled on first read for old rows
+
+A pruned row (local cache passed its 14 day retention) answers 410, never 404, so a
+client can tell "gone" apart from a URL it built wrongly.
 
 ## Plans
 

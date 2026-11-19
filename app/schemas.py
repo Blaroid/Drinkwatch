@@ -189,6 +189,7 @@ class PhotoOut(BaseModel):
     id: int
     token: str
     url: str
+    thumb_url: str | None = None
     content_type: str
     bytes: int
     width: int | None = None
