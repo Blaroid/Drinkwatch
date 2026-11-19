@@ -110,8 +110,9 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
       notify.py            price alert evaluation -> notifications
       scheduler.py         APScheduler jobs
       api/                 public, crowd, admin, photos, barcode, basket, alerts, appdownload
-      scrape/              spudshed, woolworths, coles, iga, gtin, normalize, runner
-    scripts/               seed, migrate, backfill, backfill_barcodes, barcode_report, clean_names, photos-sync, smoke
+      scrape/              spudshed, woolworths, coles, iga, gtin, fuelwatch, normalize, runner
+    scripts/               seed, migrate, backfill, backfill_barcodes, barcode_report,
+                           clean_names, photos-sync, smoke, purge_smoke, review
     migrations/            SQL migrations, applied in filename order
     photos/                uploaded price-tag images, served by /v1/photos
 
@@ -194,6 +195,11 @@ ones from the current run.
   `python scripts/smoke.py --cleanup` reports them and `--cleanup --apply`
   deletes them, along with the `price_daily` rows they wrote;
   `python scripts/purge_smoke.py --apply` is the same cleanup for a backlog.
+* **Moderation** - `python scripts/review.py queue` prints the pending products
+  with each crowd sighting (price, store, note, tag photo) and the observations
+  flagged for review. `approve` / `reject` decide a product, `links` proposes
+  cross-chain duplicates and `confirm` links a pair. Every write is a dry run
+  until `--apply`, so a mistyped slug does not change production.
 
 ## Data model notes
 

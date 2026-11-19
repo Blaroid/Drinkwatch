@@ -7,10 +7,11 @@
 
 Checks the read paths the Android app depends on, plus one crowd write round trip.
 
-Every run writes real rows: a device, crowd sightings, a photo and a pending
-product. They are marked with the constants below so `--cleanup` can find them
-again; the checks stay HTTP-only and the cleanup is a dry run unless --apply is
-given.
+Every run writes real rows: a device, crowd sightings, a photo, an alert and a
+pending product. They are marked with the constants below so `--cleanup` can
+find them again; the checks stay HTTP-only and the cleanup is a dry run unless
+--apply is given. `scripts/purge_smoke.py` runs the same cleanup over a backlog
+left by earlier runs.
 """
 
 from __future__ import annotations
