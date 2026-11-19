@@ -293,8 +293,14 @@ the scan further and still work alongside the radius.
     200 [{"line": "MONSTER ULTRA 4PK 17.50", "price_cents": 1750,
           "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 0.67}]
 
-OCR happens on the device (ML Kit); this endpoint only matches the text to the
-catalogue so the user can confirm a whole docket at once.
+A batch is charged against the hourly crowd write quota once, for its whole
+line count, rather than once per line: a receipt is one act of reporting. If
+the docket does not fit the quota left in the hour the request is refused with
+`429` before any row is written; a line that fails validation is still reported
+per item as above and does not fail the docket.
+
+OCR happens on the device (ML Kit); the parse endpoint only matches the text to
+the catalogue so the user can confirm a whole docket at once.
 
 ## Discovery
 
