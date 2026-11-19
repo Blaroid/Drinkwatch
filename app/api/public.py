@@ -146,6 +146,7 @@ def _offer(
         litres = product.size_ml * product.pack_count / 1000
         per_litre = round(obs.price_cents / litres) if litres > 0 else None
     return OfferOut(
+        observation_id=obs.id,
         store_id=store.id,
         store_name=store.name,
         chain_code=store.chain.code,

@@ -55,6 +55,7 @@ class DealStatsOut(BaseModel):
 class OfferOut(BaseModel):
     """One store's current price for a product."""
 
+    observation_id: int | None = None
     store_id: int
     store_name: str
     chain_code: str
