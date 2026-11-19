@@ -4,6 +4,10 @@
     python scripts/smoke.py https://cans.hazzardous.online
 
 Checks the read paths the Android app depends on, plus one crowd write round trip.
+
+It writes real rows. The device (``app_version=smoke``), the note, the pending
+``monster-smoke-test-500ml`` product and the 32x32 PNG are all markers that
+``scripts/smoke_cleanup.py`` keys on to purge them again.
 """
 
 from __future__ import annotations

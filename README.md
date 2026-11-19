@@ -109,7 +109,8 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
       scheduler.py         APScheduler jobs
       api/                 public, crowd, admin, photos, barcode, basket, alerts, appdownload
       scrape/              spudshed, woolworths, coles, iga, fuelwatch, normalize, runner
-    scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke
+    scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke,
+                           review, smoke_cleanup
     migrations/            SQL migrations, applied in filename order
     docs/                  screenshots
 
@@ -158,9 +159,17 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   database (`gunzip -c backup.sql.gz | psql ...`), run
   `python scripts/migrate.py`, then start the API so the entrypoint's schema
   check compares keys and constraints, not just columns.
+* **Moderation** - `python scripts/review.py queue` prints the pending products
+  with each crowd sighting (price, store, note, tag photo) and the observations
+  flagged for review. `approve` / `reject` decide a product, `links` proposes
+  cross-chain duplicates and `confirm` links a pair. Every write is a dry run
+  until `--apply`, so a mistyped slug does not change production.
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
-  exercises 30 read/crowd/plan paths. It writes real rows; clean them with the SQL
-  in the script header.
+  exercises 30 read/crowd/plan paths. It writes real rows: a synthetic device
+  (`app_version=smoke`), a crowd price, a 32x32 photo, a pending
+  `monster-smoke-test-500ml` product, an alert and a notification. Purge them with
+  `python scripts/smoke_cleanup.py` (report only) and `--apply` to delete; the
+  markers are the smoke test's own, so no real curator data matches.
 
 ## Data model notes
 

@@ -330,9 +330,17 @@ substring matches, and distance annotates (and sorts) when lat/lon are given.
 
 ## Admin additions
 
-    GET  /v1/admin/products/pending
+    GET  /v1/admin/products/pending           pending products, each with its
+                                              crowd sightings (price, store, note,
+                                              photo_token, observation status)
     POST /v1/admin/products/{slug}/approve   {"size_ml": 500, "caffeine_mg_per_100ml": 32,
                                               "merge_into_slug": null}
     POST /v1/admin/products/{slug}/reject
+    GET  /v1/admin/observations?status=needs_review&limit=100
     GET  /v1/admin/photos?limit=50
     POST /v1/admin/alerts/evaluate           -> {"notifications_created": 1}
+
+`scripts/review.py` is the operator client for these: `queue` prints both review
+queues with their evidence, `approve` / `reject` / `confirm` write, and
+`observation ID accepted|needs_review|rejected` decides a single sighting. Writes
+are dry runs unless `--apply` is passed.

@@ -12,7 +12,17 @@ from sqlalchemy.orm import Session
 from ..caffeine import apply_reference_caffeine
 from ..daily import sync_daily_price
 from ..db import get_session
-from ..models import Chain, Device, Listing, Observation, Product, Report, ScrapeRun, Store
+from ..models import (
+    Chain,
+    Device,
+    Listing,
+    Observation,
+    Photo,
+    Product,
+    Report,
+    ScrapeRun,
+    Store,
+)
 from ..security import require_admin
 from .deps import utcnow
 
@@ -54,17 +64,21 @@ def stats(session: Session = Depends(get_session)) -> dict:
     def count(table) -> int:
         return int(session.scalar(select(func.count()).select_from(table)) or 0)
 
+    # Stores and observations are counted in their own subqueries. Joining both
+    # onto Chain in one query multiplies each observation by the number of stores
+    # in the chain, which read as ~30x too many rows on the live database.
     per_chain = session.execute(
         select(
             Chain.code,
-            func.count(func.distinct(Store.id)).label("stores"),
-            func.count(Observation.id).label("observations"),
-        )
-        .select_from(Chain)
-        .outerjoin(Store, Store.chain_id == Chain.id)
-        .outerjoin(Observation, Observation.chain_id == Chain.id)
-        .group_by(Chain.code)
-        .order_by(Chain.code)
+            select(func.count(Store.id))
+            .where(Store.chain_id == Chain.id)
+            .scalar_subquery()
+            .label("stores"),
+            select(func.count(Observation.id))
+            .where(Observation.chain_id == Chain.id)
+            .scalar_subquery()
+            .label("observations"),
+        ).order_by(Chain.code)
     ).all()
     per_source = session.execute(
         select(Observation.source, func.count()).group_by(Observation.source)
@@ -382,14 +396,48 @@ def devices(limit: int = Query(default=100, ge=1, le=500), session: Session = De
 def pending_products(
     limit: int = Query(default=100, ge=1, le=500), session: Session = Depends(get_session)
 ) -> list[dict]:
+    """The product queue, with the crowd sightings a decision has to judge.
+
+    A moderator cannot decide from a name and a count: the price, the store, the
+    device and the tag photo are the evidence. Returning them with the product
+    keeps ``scripts/review.py queue`` to one round trip per list.
+    """
+    products = list(
+        session.scalars(
+            select(Product)
+            .where(Product.status == "pending")
+            .order_by(Product.id.desc())
+            .limit(limit)
+        )
+    )
+    if not products:
+        return []
+
+    sightings: dict[int, list[dict]] = {product.id: [] for product in products}
     rows = session.execute(
-        select(Product, func.count(Observation.id))
-        .outerjoin(Observation, Observation.product_id == Product.id)
-        .where(Product.status == "pending")
-        .group_by(Product.id)
-        .order_by(Product.id.desc())
-        .limit(limit)
+        select(Observation, Store.name, Store.suburb, Photo.token)
+        .outerjoin(Store, Store.id == Observation.store_id)
+        .outerjoin(Photo, Photo.id == Observation.photo_id)
+        .where(Observation.product_id.in_(list(sightings)))
+        .order_by(Observation.observed_at.desc(), Observation.id.desc())
     ).all()
+    for observation, store_name, suburb, photo_token in rows:
+        sightings[observation.product_id].append(
+            {
+                "id": observation.id,
+                "price_cents": observation.price_cents,
+                "status": observation.status,
+                "source": observation.source,
+                "store": store_name,
+                "suburb": suburb,
+                "device_id": observation.device_id,
+                "note": observation.note,
+                "photo_url": observation.photo_url,
+                "photo_token": photo_token,
+                "observed_at": observation.observed_at,
+            }
+        )
+
     return [
         {
             "slug": product.slug,
@@ -398,10 +446,64 @@ def pending_products(
             "size_ml": product.size_ml,
             "pack_count": product.pack_count,
             "barcode": product.normalised_barcode or product.barcode,
-            "observations": int(count or 0),
+            "observations": len(sightings[product.id]),
+            "sightings": sightings[product.id],
             "created_at": product.created_at,
         }
-        for product, count in rows
+        for product in products
+    ]
+
+
+@router.get("/observations", summary="Price rows awaiting a moderation decision")
+def observations(
+    status_filter: str = Query(
+        default="needs_review",
+        alias="status",
+        pattern="^(accepted|needs_review|rejected)$",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    """Observations outside the pending-product queue (outliers on known cans).
+
+    The pending product list only shows rows for products nobody has curated yet;
+    a crowd price on an existing product can still be flagged by the outlier
+    check, and that decision lives here.
+    """
+    rows = session.execute(
+        select(
+            Observation,
+            Product.slug,
+            Product.brand,
+            Product.name,
+            Store.name,
+            Device.display_name,
+            Photo.token,
+        )
+        .join(Product, Product.id == Observation.product_id)
+        .outerjoin(Store, Store.id == Observation.store_id)
+        .outerjoin(Device, Device.id == Observation.device_id)
+        .outerjoin(Photo, Photo.id == Observation.photo_id)
+        .where(Observation.status == status_filter)
+        .order_by(Observation.observed_at.desc(), Observation.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": observation.id,
+            "product_slug": slug,
+            "product_label": f"{brand} {name}".strip(),
+            "price_cents": observation.price_cents,
+            "status": observation.status,
+            "source": observation.source,
+            "store": store_name,
+            "device": device_name,
+            "note": observation.note,
+            "photo_url": observation.photo_url,
+            "photo_token": photo_token,
+            "observed_at": observation.observed_at,
+        }
+        for observation, slug, brand, name, store_name, device_name, photo_token in rows
     ]
 
 
@@ -463,8 +565,6 @@ def reject_product(slug: str, session: Session = Depends(get_session)) -> dict:
 def recent_photos(
     limit: int = Query(default=50, ge=1, le=200), session: Session = Depends(get_session)
 ) -> list[dict]:
-    from ..models import Photo
-
     return [
         {
             "id": photo.id,
