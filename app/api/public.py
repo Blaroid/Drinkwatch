@@ -120,10 +120,13 @@ def _offers_for_product(
     by_id = {store.id: (store, distance) for store, distance in store_distances}
     now = utcnow()
     offers: list[OfferOut] = []
-    for store_id, obs in observations.items():
+    for store_id, current in observations.items():
         store, distance = by_id.get(store_id, (None, None))
         if store is None:
             continue
+        # `latest_prices` already chose the fresher of the store sighting and
+        # the chain-wide online price, so a stale row cannot set this offer.
+        obs = current.primary
         per_can = (
             round(obs.price_cents / product.pack_count) if product.pack_count > 1 else None
         )

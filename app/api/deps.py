@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -166,16 +167,81 @@ def bulk_latest_prices(
     return found
 
 
+@dataclass(frozen=True)
+class StorePrice:
+    """The freshest row for one store, plus the row it beat.
+
+    `primary` is what the store is showing now; `fallback` is the other scope's
+    row, kept because it is still evidence — usually the only first-hand
+    sighting for that shelf — and dropping it here would force a caller that
+    wants the other view to query the ledger again.
+    """
+
+    primary: Observation
+    fallback: Observation | None = None
+
+
+def _as_utc(moment: datetime) -> datetime:
+    # Compare in one timezone: a naive timestamp (age_hours() tolerates those
+    # as well) must not raise TypeError halfway through a request.
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _chain_attributed(row: Observation, store_id: int) -> Observation:
+    """Copy a chain-wide row (store_id NULL) so it can stand for one store."""
+    return Observation(
+        id=row.id,
+        store_id=store_id,
+        chain_id=row.chain_id,
+        product_id=row.product_id,
+        price_cents=row.price_cents,
+        was_price_cents=row.was_price_cents,
+        unit_price_cents_per_l=row.unit_price_cents_per_l,
+        promo_kind=row.promo_kind,
+        promo_qty=row.promo_qty,
+        promo_total_cents=row.promo_total_cents,
+        in_stock=row.in_stock,
+        source=row.source,
+        price_scope="chain",
+        observed_at=row.observed_at,
+    )
+
+
+def _freshest(
+    store_row: Observation | None,
+    chain_row: Observation | None,
+    store_id: int,
+) -> StorePrice | None:
+    """Pick whichever of the two candidate rows was observed more recently.
+
+    Freshest wins rather than "store scope wins" because age is what makes a
+    price wrong: a crowd report from 71 hours ago silently shadowing last
+    night's scrape is how a stale $3.15 ends up the headline "cheapest" beside
+    a real $3.50. On an exact tie the store-scoped row wins, since it was seen
+    on that shelf rather than published for the whole chain.
+    """
+    if chain_row is None:
+        return StorePrice(primary=store_row) if store_row is not None else None
+    chain_offer = _chain_attributed(chain_row, store_id)
+    if store_row is None:
+        return StorePrice(primary=chain_offer)
+    if _as_utc(chain_row.observed_at) > _as_utc(store_row.observed_at):
+        return StorePrice(primary=chain_offer, fallback=store_row)
+    return StorePrice(primary=store_row, fallback=chain_offer)
+
+
 def latest_prices(
     session: Session,
     stores: list[Store],
     product_ids: list[int] | int,
     since: datetime,
-) -> dict[int, Observation]:
-    """Newest accepted price per store.
+) -> dict[int, StorePrice]:
+    """Freshest accepted price per store, whichever scope it came from.
 
-    Store-specific sightings (SpudShed, crowd) win; otherwise the chain-wide
-    online price is attributed to every store in that chain.
+    Both candidates are always fetched: the store's own sightings and the
+    chain-wide online price attributed to every store in that chain. Whichever
+    was observed most recently becomes the offer, so a stale store row can no
+    longer shadow last night's scrape; the losing row is kept as a fallback.
     """
     if not stores:
         return {}
@@ -185,35 +251,25 @@ def latest_prices(
     rows = session.execute(
         _STORE_SCOPE_SQL, {"store_ids": store_ids, "product_ids": product_ids, "since": since}
     ).mappings()
-    by_store: dict[int, Observation] = {row["store_id"]: Observation(**dict(row)) for row in rows}
+    store_rows = {row["store_id"]: Observation(**dict(row)) for row in rows}
 
-    missing_chains = {store.chain_id for store in stores if store.id not in by_store}
-    if missing_chains:
-        chain_rows = session.execute(
+    chain_rows = {
+        row["chain_id"]: Observation(**dict(row))
+        for row in session.execute(
             _CHAIN_SCOPE_SQL,
-            {"chain_ids": sorted(missing_chains), "product_ids": product_ids, "since": since},
+            {
+                "chain_ids": sorted({store.chain_id for store in stores}),
+                "product_ids": product_ids,
+                "since": since,
+            },
         ).mappings()
-        chain_prices = {row["chain_id"]: Observation(**dict(row)) for row in chain_rows}
-        for store in stores:
-            if store.id in by_store or store.chain_id not in chain_prices:
-                continue
-            chain_row = chain_prices[store.chain_id]
-            by_store[store.id] = Observation(
-                id=chain_row.id,
-                store_id=store.id,
-                chain_id=chain_row.chain_id,
-                product_id=chain_row.product_id,
-                price_cents=chain_row.price_cents,
-                was_price_cents=chain_row.was_price_cents,
-                unit_price_cents_per_l=chain_row.unit_price_cents_per_l,
-                promo_kind=chain_row.promo_kind,
-                promo_qty=chain_row.promo_qty,
-                promo_total_cents=chain_row.promo_total_cents,
-                in_stock=chain_row.in_stock,
-                source=chain_row.source,
-                price_scope="chain",
-                observed_at=chain_row.observed_at,
-            )
+    }
+
+    by_store: dict[int, StorePrice] = {}
+    for store in stores:
+        chosen = _freshest(store_rows.get(store.id), chain_rows.get(store.chain_id), store.id)
+        if chosen is not None:
+            by_store[store.id] = chosen
     return by_store
 
 
