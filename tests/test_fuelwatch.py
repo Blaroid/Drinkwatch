@@ -10,8 +10,11 @@ number and phone-less sites left their whole suburb unquoted.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import httpx
 
 from app.scrape import fuelwatch
 from app.scrape.fuelwatch import lookup_suburb, state_median_cents
@@ -74,6 +77,36 @@ def _stub_feed(monkeypatch, text: str | None = None) -> list[dict]:
     return calls
 
 
+def _stub_failure(monkeypatch) -> list[dict]:
+    """Wire ulp_prices() to a feed that times out; returns the attempted reads."""
+    calls: list[dict] = []
+
+    class _Client:
+        """Every read fails the way the real feed does while it is down."""
+
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def get(self, url: str, params: dict | None = None) -> _Response:
+            calls.append({"url": url, "params": dict(params or {})})
+            raise httpx.ConnectTimeout("feed down")
+
+    monkeypatch.setattr(fuelwatch, "httpx", SimpleNamespace(Client=_Client))
+    monkeypatch.setattr(
+        fuelwatch,
+        "settings",
+        SimpleNamespace(fuelwatch_enabled=True, scrape_user_agent="test"),
+    )
+    monkeypatch.setattr(fuelwatch, "_cache", {})
+    return calls
+
+
 def test_parse_keeps_the_cheapest_site_per_suburb() -> None:
     prices = fuelwatch._parse(_feed(_item("KARAWARA", "203.9"), _item("KARAWARA", "199.9")))
 
@@ -131,6 +164,49 @@ def test_ulp_prices_is_cached_between_plan_requests(monkeypatch) -> None:
 
     assert len(calls) == 1
     assert second is first
+
+
+def test_a_failed_fetch_is_not_re_downloaded_within_the_backoff(monkeypatch) -> None:
+    calls = _stub_failure(monkeypatch)
+
+    assert fuelwatch.ulp_prices() == {}
+    assert fuelwatch.ulp_prices() == {}
+    assert fuelwatch.ulp_prices() == {}
+
+    # One attempt, not one 20 s timeout per basket/route request.
+    assert len(calls) == 1
+
+
+def test_a_failed_fetch_serves_the_last_good_map(monkeypatch) -> None:
+    calls = _stub_failure(monkeypatch)
+    # A good map older than the normal TTL: still better than pricing on the
+    # hard-coded fallback while the feed is down.
+    fuelwatch._cache["product:1"] = (
+        time.monotonic() - fuelwatch.CACHE_TTL_SECONDS - 1,
+        {"PERTH": 204},
+    )
+
+    assert fuelwatch.ulp_prices() == {"PERTH": 204}
+    assert fuelwatch.ulp_prices() == {"PERTH": 204}
+    assert len(calls) == 1
+
+
+def test_the_feed_is_retried_once_the_backoff_expires(monkeypatch) -> None:
+    calls = _stub_feed(monkeypatch)
+    fuelwatch._cache["failed:1"] = (
+        time.monotonic() - fuelwatch.FAILURE_TTL_SECONDS - 1,
+        {},
+    )
+
+    assert fuelwatch.ulp_prices() == {
+        "KARAWARA": 204,
+        "MADDINGTON": 190,
+        "PERTH": 204,
+        "DIANELLA": 184,
+    }
+    assert len(calls) == 1
+    # A recovery clears the marker so the next failure is timed from then on.
+    assert "failed:1" not in fuelwatch._cache
 
 
 def test_store_suburb_matches_a_more_general_station_locality() -> None:
