@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..daily import record_daily_price
+from ..daily import local_day, record_daily_price
 from ..models import Chain, Observation, Product, ScrapeRun, Store
 from .normalize import per_litre_cents
 
@@ -160,6 +160,30 @@ class CffiClient(_Throttled):
         self.close()
 
 
+def observation_dedupe_key(
+    *,
+    source: str,
+    location: str,
+    product_id: int,
+    price_cents: int,
+    promo_kind: str,
+    promo_qty: int | None,
+    promo_total_cents: int | None,
+    observed_at: datetime,
+) -> str:
+    """Identity of one sighting: same scope, product, offer and *local* day.
+
+    The day is the Perth day, the same one ``price_daily`` is keyed by. The UTC
+    date disagreed with the ledger for every sighting between midnight and
+    08:00 local, so a morning run wrote a second sighting for a price that had
+    not changed since the evening before.
+    """
+    return (
+        f"{source}:{location}:{product_id}:{local_day(observed_at).isoformat()}:"
+        f"{price_cents}:{promo_kind}:{promo_qty or 0}:{promo_total_cents or 0}"
+    )
+
+
 def record_price(
     session: Session,
     *,
@@ -188,9 +212,15 @@ def record_price(
     location = (
         f"store{store_id}" if store_id is not None else f"chain{chain_id}:{state or 'unscoped'}"
     )
-    key = dedupe_key or (
-        f"{source}:{location}:{product.id}:{observed_at.date().isoformat()}:"
-        f"{price_cents}:{promo_kind}:{promo_qty or 0}:{promo_total_cents or 0}"
+    key = dedupe_key or observation_dedupe_key(
+        source=source,
+        location=location,
+        product_id=product.id,
+        price_cents=price_cents,
+        promo_kind=promo_kind,
+        promo_qty=promo_qty,
+        promo_total_cents=promo_total_cents,
+        observed_at=observed_at,
     )
     stmt = (
         pg_insert(Observation)
@@ -247,6 +277,17 @@ def finish_run(
     *,
     error: str | None = None,
 ) -> None:
+    """Record the outcome of a run, re-inserting a row a rollback discarded.
+
+    ``begin_run`` flushes the row inside the scraper's transaction, so a run
+    that raises loses it to runner's rollback: SQLAlchemy expunges a row that
+    was never committed, and writing the outcome to that expunged object left no
+    ``scrape_runs`` evidence at all. A run whose own commits put the row on disk
+    is still persistent and is only updated here.
+    """
+    if sa_inspect(run).transient:
+        session.add(run)
+        session.flush()
     run.finished_at = datetime.now(timezone.utc)
     run.items_seen = stats.items_seen
     run.observations_written = stats.observations_written
