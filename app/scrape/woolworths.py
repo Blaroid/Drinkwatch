@@ -105,6 +105,17 @@ def _upsert_listing(session: Session, chain_id: int, raw: dict, product: Product
     return listing
 
 
+def _pack_text(raw: dict, name: str) -> str:
+    """The fields that say how much is in the SKU, read as one string.
+
+    PackageSize alone is not enough: for a multipack it is the carton total
+    ("6000ML" for 24 x 250mL), and for some listings it names no size at all
+    ("4 Pack"). The can size lives in the product name, so the two are parsed
+    together or a carton is stored as one very expensive can.
+    """
+    return f"{raw.get('PackageSize') or ''} {name}".strip()
+
+
 def scrape(
     session: Session,
     store_ids: list[int] | None = None,
@@ -150,7 +161,7 @@ def scrape(
                 price_cents = round(float(price_dollars) * 100)
                 was_price = raw.get("WasPrice")
                 was_cents = round(float(was_price) * 100) if was_price else None
-                size_ml, pack_count = parse_pack(raw.get("PackageSize") or name)
+                size_ml, pack_count = parse_pack(_pack_text(raw, name))
                 if not is_energy_item(name, None, size_ml):
                     continue
                 product, created = match_product_woolworths(
