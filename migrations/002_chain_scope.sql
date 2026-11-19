@@ -23,4 +23,9 @@ create index if not exists ix_obs_chain_product_time
     on observations (chain_id, product_id, observed_at);
 
 -- One-off cleanup: drop the store-expanded copies of chain-wide prices.
-delete from observations where price_scope = 'chain';
+--
+-- Only rows that still name a store are copies. A replay of this file (for
+-- example after restoring data into a database whose schema_migrations was
+-- empty) must leave the real chain-scope rows alone: they carry store_id NULL
+-- and are the price history, not the duplicate this migration removed.
+delete from observations where price_scope = 'chain' and store_id is not null;

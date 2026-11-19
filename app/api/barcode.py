@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from ..caffeine import caffeine_from_off, plausible_caffeine
 from ..config import settings
 from ..db import get_session
-from ..models import BarcodeCache, Device, Listing, Observation, Product, Store
+from ..models import BarcodeCache, Device, Observation, Store
 from ..schemas import BarcodeLookupOut, PendingProductIn, PendingProductOut, ProductOut
 from ..scrape.normalize import (
     barcode_variants,
@@ -31,6 +31,7 @@ from ..scrape.normalize import (
     register_barcode,
 )
 from ..security import current_device, read_limiter, write_limiter
+from .deps import find_product_by_barcode
 
 log = logging.getLogger(__name__)
 
@@ -113,40 +114,12 @@ def external_lookup(session: Session, barcode: str) -> dict | None:
     return suggestion
 
 
-def _find_product(session: Session, barcode: str, normalised: str | None) -> Product | None:
-    from ..models import Barcode
-
-    variants = barcode_variants(barcode)
-    if variants:
-        product = session.scalar(
-            select(Product)
-            .join(Barcode, Barcode.product_id == Product.id)
-            .where(Barcode.barcode.in_(variants))
-        )
-        if product is not None:
-            return product
-    product = session.scalar(
-        select(Product).where(
-            (Product.normalised_barcode == normalised) | (Product.barcode == barcode)
-        )
-    )
-    if product is not None:
-        return product
-    if normalised:
-        listing = session.scalar(
-            select(Listing).where(Listing.barcode.in_(variants + [normalised]))
-        )
-        if listing is not None and listing.product_id is not None:
-            return session.get(Product, listing.product_id)
-    return None
-
-
 @router.get("/barcode/{barcode}", response_model=BarcodeLookupOut, summary="Resolve a scanned barcode")
 def lookup(barcode: str, session: Session = Depends(get_session)) -> BarcodeLookupOut:
     normalised = normalize_barcode(barcode)
     # A GTIN-14's check digit covers its packaging indicator, so validate every form.
     checksum_ok = any(ean13_checksum_ok(variant) for variant in barcode_variants(barcode))
-    product = _find_product(session, barcode, normalised)
+    product = find_product_by_barcode(session, barcode, normalised)
     if product is not None:
         return BarcodeLookupOut(
             found=True,
@@ -194,7 +167,7 @@ def submit_pending(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown store")
 
     created = False
-    product = _find_product(session, payload.barcode, normalised)
+    product = find_product_by_barcode(session, payload.barcode, normalised)
 
     if product is None:
         size_ml = payload.size_ml

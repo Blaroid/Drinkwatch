@@ -7,7 +7,15 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import (
+    CheckConstraint,
+    MetaData,
+    UniqueConstraint,
+    create_engine,
+    inspect as sa_inspect,
+    text,
+)
+from sqlalchemy.engine import Inspector
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
@@ -62,37 +70,96 @@ def wait_for_db(attempts: int = 40, delay: float = 1.5) -> None:
     raise RuntimeError(f"database unavailable after {attempts} attempts: {last_error}")
 
 
-def missing_columns() -> list[str]:
-    """Columns the models expect that the database does not have yet.
+def _unique_keys(inspector: Inspector, table_name: str) -> set[tuple[str, ...]]:
+    """Column sets covered by a unique constraint or a unique index."""
+    keys = {
+        tuple(sorted(constraint["column_names"]))
+        for constraint in inspector.get_unique_constraints(table_name)
+    }
+    keys.update(
+        tuple(sorted(index["column_names"]))
+        for index in inspector.get_indexes(table_name)
+        if index.get("unique")
+    )
+    return keys
 
-    `create_all` only creates missing tables, never missing columns, so a model
-    change without a migration is invisible until a query selects the column and
-    the API 500s. This turns that into a startup failure with a readable list.
+
+def schema_problems(
+    inspector: Inspector | None = None, metadata: MetaData | None = None
+) -> list[str]:
+    """Ways the database schema disagrees with the models.
+
+    Columns alone are not enough: migration 012 replaced price_daily's primary
+    key with a unique index, and a restore that lost schema_migrations can leave
+    a database that answers every query while missing a key, a unique constraint
+    or a check. Compare those too, so the startup check fails with a readable
+    list instead of serving ambiguous rows.
+
+    Only model-declared objects are required to exist. Constraints that a SQL
+    migration adds but the models do not describe (the alert triggers, for
+    example) are deliberately ignored rather than reported as extra.
     """
-    from sqlalchemy import inspect
-
     from . import models
 
-    inspector = inspect(engine)
-    missing: list[str] = []
-    for table in models.Base.metadata.sorted_tables:
+    inspector = inspector if inspector is not None else sa_inspect(engine)
+    metadata = metadata if metadata is not None else models.Base.metadata
+
+    problems: list[str] = []
+    for table in metadata.sorted_tables:
         if not inspector.has_table(table.name):
-            missing.append(f"{table.name} (table)")
+            problems.append(f"{table.name} (table)")
             continue
+
         present = {column["name"] for column in inspector.get_columns(table.name)}
-        missing.extend(
-            f"{table.name}.{column.name}" for column in table.columns if column.name not in present
+        problems.extend(
+            f"{table.name}.{column.name} (column)"
+            for column in table.columns
+            if column.name not in present
         )
-    return missing
+
+        expected_pk = {column.name for column in table.primary_key.columns}
+        actual_pk = set(inspector.get_pk_constraint(table.name).get("constrained_columns") or ())
+        if actual_pk != expected_pk:
+            problems.append(
+                f"{table.name} primary key {sorted(actual_pk)} != {sorted(expected_pk)}"
+            )
+
+        expected_unique = {
+            tuple(sorted(column.name for column in constraint.columns))
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+        expected_unique.update(
+            tuple(sorted(column.name for column in index.columns))
+            for index in table.indexes
+            if index.unique
+        )
+        for columns in sorted(expected_unique - _unique_keys(inspector, table.name)):
+            problems.append(f"{table.name} unique ({', '.join(columns)}) is missing")
+
+        expected_checks = {
+            constraint.name
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint) and constraint.name
+        }
+        actual_checks = {
+            constraint["name"] for constraint in inspector.get_check_constraints(table.name)
+        }
+        problems.extend(
+            f"{table.name}.{name} (check constraint) is missing"
+            for name in sorted(expected_checks - actual_checks)
+        )
+
+    return problems
 
 
 def verify_schema() -> None:
-    missing = missing_columns()
-    if missing:
+    problems = schema_problems()
+    if problems:
         raise RuntimeError(
-            "database schema is behind the models; run scripts/migrate.py. Missing: "
-            + ", ".join(missing[:10])
-            + ("" if len(missing) <= 10 else f" (+{len(missing) - 10} more)")
+            "database schema does not match the models; run scripts/migrate.py. Problems: "
+            + ", ".join(problems[:10])
+            + ("" if len(problems) <= 10 else f" (+{len(problems) - 10} more)")
         )
 
 

@@ -30,7 +30,15 @@ STORE = SimpleNamespace(
 )
 
 
-def _offer(product: SimpleNamespace, label: str, price_cents: int, pack_count: int) -> pricing.Offer:
+def _offer(
+    product: SimpleNamespace,
+    label: str,
+    price_cents: int,
+    pack_count: int,
+    promo_kind: str = "none",
+    promo_qty: int | None = None,
+    promo_total_cents: int | None = None,
+) -> pricing.Offer:
     return pricing.Offer(
         product_id=product.id,
         slug=product.slug,
@@ -42,9 +50,9 @@ def _offer(product: SimpleNamespace, label: str, price_cents: int, pack_count: i
         distance_km=0.1,
         price_cents=price_cents,
         was_price_cents=None,
-        promo_kind="none",
-        promo_qty=None,
-        promo_total_cents=None,
+        promo_kind=promo_kind,
+        promo_qty=promo_qty,
+        promo_total_cents=promo_total_cents,
         size_ml=500,
         pack_count=pack_count,
         caffeine_mg_per_100ml=32.0,
@@ -54,13 +62,30 @@ def _offer(product: SimpleNamespace, label: str, price_cents: int, pack_count: i
     )
 
 
-def _wire(monkeypatch: pytest.MonkeyPatch) -> None:
+def _wire(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    single_cents: int = 329,
+    four_pack_cents: int = 1316,
+    multibuy: tuple[int, int] | None = None,
+) -> None:
     # The 4-pack is listed first, the order the live catalogue returned it in:
     # that was enough for the old first-match label to name the wrong product.
     family = [FOUR_PACK, SINGLE]
+    promo_qty, promo_total_cents = multibuy if multibuy else (None, None)
     offers = {
-        SINGLE.id: [_offer(SINGLE, "Monster Mango Loco 500ml", 329, 1)],
-        FOUR_PACK.id: [_offer(FOUR_PACK, "Monster Mango Loco 500ml x4", 1316, 4)],
+        SINGLE.id: [
+            _offer(
+                SINGLE,
+                "Monster Mango Loco 500ml",
+                single_cents,
+                1,
+                promo_kind="multibuy" if multibuy else "none",
+                promo_qty=promo_qty,
+                promo_total_cents=promo_total_cents,
+            )
+        ],
+        FOUR_PACK.id: [_offer(FOUR_PACK, "Monster Mango Loco 500ml x4", four_pack_cents, 4)],
     }
     monkeypatch.setattr(basket, "nearby_stores", lambda *args, **kwargs: [(STORE, 0.1)])
     monkeypatch.setattr(
@@ -108,9 +133,34 @@ def test_route_stop_names_the_single_it_buys(monkeypatch: pytest.MonkeyPatch):
     assert item["label"] == "Monster Mango Loco 500ml"
 
 
+def test_basket_line_buys_the_pack_the_audit_missed(monkeypatch: pytest.MonkeyPatch):
+    # Live Coles prices: single $4.70 and a 4-pack at $10.50. The endpoint used to
+    # report "4 x single" for $18.80 because prune_bundles dropped the pack.
+    _wire(monkeypatch, single_cents=470, four_pack_cents=1050)
+    result = basket.basket_compare(_payload(4), session=None)
+
+    line = result.stores[0].items[0]
+    assert line.cost_cents == 1050
+    assert line.units == 4
+    assert line.breakdown == ["1 x 4-pack @ $10.50"]
+    assert line.product_slug == FOUR_PACK.slug
+    assert line.label == "Monster Mango Loco 500ml x4"
+
+
+def test_basket_line_buys_the_multibuy(monkeypatch: pytest.MonkeyPatch):
+    _wire(monkeypatch, single_cents=470, four_pack_cents=2000, multibuy=(2, 790))
+    result = basket.basket_compare(_payload(2), session=None)
+
+    line = result.stores[0].items[0]
+    assert line.cost_cents == 790
+    assert line.units == 2
+    assert line.breakdown == ["1 x 2 x 1-pack deal @ $7.90"]
+    assert line.product_slug == SINGLE.slug
+
+
 def test_line_product_follows_the_money_when_a_plan_mixes_packs():
-    # prune_bundles currently drops most bulk options, but once it does not, a
-    # plan can buy a 4-pack and a single from two products. The line is labelled
+    # A plan can buy a 4-pack and a single from two products (the Pareto prune
+    # keeps both when each is cheapest for some quantity). The line is labelled
     # with the product carrying most of the cost.
     broken = pricing.Bundle(1, 400, 160.0, "single", 10, "monster-500ml", "Monster 500ml")
     pack = pricing.Bundle(4, 300, 640.0, "4-pack", 11, "monster-500ml-x4", "Monster 500ml x4")

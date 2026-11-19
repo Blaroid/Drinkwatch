@@ -60,7 +60,7 @@ TABLES = (
 @pytest.fixture(autouse=True)
 def _stub_daily_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the Postgres-only price_daily upsert out of the SQLite fixture."""
-    monkeypatch.setattr(crowd_api, "record_daily_price", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crowd_api, "sync_daily_price", lambda *args, **kwargs: None)
 
 
 @pytest.fixture()

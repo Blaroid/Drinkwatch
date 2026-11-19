@@ -317,6 +317,29 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+def _is_plain(product: Product) -> bool:
+    """Whether a row is the base variant.
+
+    The catalogue names those "Original" (see the create path below); anything
+    else names a flavour, even when the words are noise like "Sugarfree".
+    """
+    return product.name.strip().lower() == "original"
+
+
+def _plain_variant(candidates: list[Product]) -> Product | None:
+    """The row a brand-only retailer title refers to, when that is unambiguous.
+
+    "Red Bull Energy Drink 473mL" names no flavour, so its token set is empty and
+    Jaccard scoring gives every candidate 0.0 - the dead branch this replaces.
+    The plain row with the same brand/size/pack is the product it describes; a
+    lone *flavoured* row is not, because the title names the base can, not
+    whatever flavour happens to be the only one catalogued. Two candidates both
+    claiming to be plain stay ambiguous and fall through to the create path.
+    """
+    plain = [candidate for candidate in candidates if _is_plain(candidate)]
+    return plain[0] if len(plain) == 1 else None
+
+
 def match_product(
     session: Session,
     *,
@@ -353,21 +376,31 @@ def match_product(
                 func.lower(Product.brand) == brand.lower(),
                 Product.size_ml == size_ml,
                 Product.pack_count == pack_count,
+                # Deactivated rows are hidden from every read path, so new
+                # prices must not land on them. scripts/merge_duplicates.py
+                # leaves the doubles it folded away inactive, and they still
+                # share this brand/size/pack key.
+                Product.is_active.is_(True),
             )
         )
     )
     wanted = flavour_tokens(clean_flavour(name, brand))
-    scored: list[tuple[float, Product]] = []
-    for candidate in candidates:
-        have = flavour_tokens(
-            " ".join(filter(None, [candidate.name, candidate.variant]))
-        )
-        scored.append((_jaccard(wanted, have), candidate))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    if not wanted:
+        plain = _plain_variant(candidates)
+        if plain is not None:
+            return plain, False
+    else:
+        scored: list[tuple[float, Product]] = []
+        for candidate in candidates:
+            have = flavour_tokens(
+                " ".join(filter(None, [candidate.name, candidate.variant]))
+            )
+            scored.append((_jaccard(wanted, have), candidate))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
 
-    if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
-        if scored[0][0] >= 0.5 or (not wanted and scored[0][0] >= 0.5):
-            return scored[0][1], False
+        if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+            if scored[0][0] >= 0.5:
+                return scored[0][1], False
 
     if not create:
         return None, False
@@ -379,6 +412,11 @@ def match_product(
     slug = build_slug(brand, flavour, None, size_ml, pack_count)
     existing = session.scalar(select(Product).where(Product.slug == slug))
     if existing is not None:
+        if not existing.is_active and existing.status != "rejected":
+            # The merged double of a plain SKU keeps this slug, so a later
+            # brand-only title is that same can: bring its row back rather than
+            # attach listings to a product no read path shows.
+            existing.is_active = True
         return existing, False
 
     barcode_norm = normalize_barcode(barcode)

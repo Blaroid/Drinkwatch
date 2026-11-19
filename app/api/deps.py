@@ -29,6 +29,17 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(math.sqrt(a))
 
 
+def bounding_box(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
+    """Latitude/longitude bounds that can serve as a cheap prefilter.
+
+    A degree of longitude shrinks towards the poles, so this box is slightly
+    generous; callers still apply haversine for the exact radius.
+    """
+    dlat = radius_km / 111.0
+    dlon = radius_km / max(0.01, 111.0 * math.cos(math.radians(lat)))
+    return lat - dlat, lat + dlat, lon - dlon, lon + dlon
+
+
 def nearby_stores(
     session: Session,
     lat: float,
@@ -38,18 +49,17 @@ def nearby_stores(
     limit: int = 300,
 ) -> list[tuple[Store, float]]:
     """Stores within radius, nearest first."""
-    dlat = radius_km / 111.0
-    dlon = radius_km / max(0.01, 111.0 * math.cos(math.radians(lat)))
-    stmt = (
-        select(Store)
-        .where(
-            Store.is_active.is_(True),
-            Store.lat.is_not(None),
-            Store.lon.is_not(None),
-            Store.lat.between(lat - dlat, lat + dlat),
-            Store.lon.between(lon - dlon, lon + dlon),
-        )
-        .limit(limit * 4)
+    lat_min, lat_max, lon_min, lon_max = bounding_box(lat, lon, radius_km)
+    # No SQL LIMIT: Postgres cannot sort by the haversine distance here, and a
+    # row limit applied before the distance filter returns whichever rows the
+    # heap offers first, so closer stores were being dropped. The bounding box
+    # already bounds the scan; `limit` is applied after sorting below.
+    stmt = select(Store).where(
+        Store.is_active.is_(True),
+        Store.lat.is_not(None),
+        Store.lon.is_not(None),
+        Store.lat.between(lat_min, lat_max),
+        Store.lon.between(lon_min, lon_max),
     )
     if chain_code:
         from ..models import Chain
@@ -386,8 +396,54 @@ def get_product_by_slug(session: Session, slug: str) -> Product:
     return product
 
 
+def find_product_by_barcode(
+    session: Session, barcode: str, normalised: str | None = None
+) -> Product | None:
+    """Resolve a scanned code against every form the catalogue indexes.
+
+    The same can arrives as an EAN-13, a GTIN-14 with a packaging indicator, a
+    UPC-A or a retailer-specific code, so matching products.barcode alone misses
+    codes the barcodes table and normalised_barcode already know. ``normalised``
+    lets a caller that has already run normalize_barcode() reuse the result; a
+    None value means the code has no canonical form, not "not computed".
+    """
+    from ..models import Barcode, Listing
+    from ..scrape.normalize import barcode_variants, normalize_barcode
+
+    if normalised is None:
+        normalised = normalize_barcode(barcode)
+    variants = barcode_variants(barcode)
+    if variants:
+        product = session.scalar(
+            select(Product)
+            .join(Barcode, Barcode.product_id == Product.id)
+            .where(Barcode.barcode.in_(variants))
+        )
+        if product is not None:
+            return product
+    # Only compare normalised_barcode when there is one: `== None` renders as
+    # IS NULL, which would alias any product the backfill never reached.
+    if normalised:
+        product = session.scalar(
+            select(Product).where(
+                (Product.normalised_barcode == normalised) | (Product.barcode == barcode)
+            )
+        )
+    else:
+        product = session.scalar(select(Product).where(Product.barcode == barcode))
+    if product is not None:
+        return product
+    if normalised:
+        listing = session.scalar(
+            select(Listing).where(Listing.barcode.in_(variants + [normalised]))
+        )
+        if listing is not None and listing.product_id is not None:
+            return session.get(Product, listing.product_id)
+    return None
+
+
 def get_product_by_barcode(session: Session, barcode: str) -> Product:
-    product = session.scalar(select(Product).where(Product.barcode == barcode))
+    product = find_product_by_barcode(session, barcode)
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown barcode: {barcode}")
     return product

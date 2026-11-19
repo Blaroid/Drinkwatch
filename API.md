@@ -137,6 +137,11 @@ Confirm or dispute someone else's sighting:
     POST /v1/observations/{id}/vote   {"vote": 1}   // or -1
     200 {observation}
 
+Votes apply to crowd sightings only: a scraped row is the chain's own published
+price, so voting on one returns 409 -- use `/v1/reports` to say a scraped price
+is wrong. The vote being cast counts toward the decision, so the second confirm
+accepts a flagged row and the third dispute flags an accepted one.
+
 Report something broken:
 
     POST /v1/reports  {"observation_id": 21448, "reason": "wrong_price", "note": "..."}
@@ -159,6 +164,9 @@ Your own history and profile:
     GET  /v1/admin/products/suggestions?brand=Monster&min_score=0.34
     POST /v1/admin/observations/{id}/status {"status": "accepted|needs_review|rejected"}
     GET  /v1/admin/devices
+
+A status change is applied to the daily price ledger too, so approving a flagged
+price adds it to the deal history and rejecting one takes it back out.
 
 ## Errors
 

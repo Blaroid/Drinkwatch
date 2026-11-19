@@ -12,7 +12,7 @@ from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..daily import record_daily_price
+from ..daily import sync_daily_price
 from ..db import get_session
 from ..models import Chain, Device, Observation, ObservationVote, Product, Store
 from ..schemas import (
@@ -29,7 +29,7 @@ from ..schemas import (
     VoteIn,
 )
 from ..security import current_device, hash_token, new_device_token, read_limiter, write_limiter
-from .deps import format_cents, utcnow
+from .deps import find_product_by_barcode, format_cents, utcnow
 
 router = APIRouter(prefix="/v1", tags=["crowd"])
 
@@ -324,7 +324,7 @@ def _record_observation(payload: ObservationIn, device: Device, session: Session
     if payload.product_slug:
         product = session.scalar(select(Product).where(Product.slug == payload.product_slug))
     elif payload.barcode:
-        product = session.scalar(select(Product).where(Product.barcode == payload.barcode))
+        product = find_product_by_barcode(session, payload.barcode)
     if product is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -406,17 +406,7 @@ def _record_observation(payload: ObservationIn, device: Device, session: Session
         # A crowd price is a sighting at one shop, so it belongs in the daily
         # ledger under that shop - otherwise today's history would only ever
         # reflect scrapes, and crowd prices would never move a deal badge.
-        record_daily_price(
-            session,
-            product_id=product.id,
-            chain_id=store.chain_id,
-            store_id=store.id,
-            price_cents=payload.price_cents,
-            was_price_cents=payload.was_price_cents,
-            promo_kind=payload.promo_kind,
-            source="crowd",
-            observed_at=observed_at,
-        )
+        sync_daily_price(session, observation)
     session.commit()
     return _serialize_one(session, observation)
 
@@ -435,6 +425,15 @@ def vote(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown observation")
     if observation.device_id == device.id:
         raise HTTPException(status.HTTP_409_CONFLICT, "cannot vote on your own observation")
+    if observation.source != "crowd":
+        # A scraped price is the chain's own published price, not a claim by a
+        # device, so there is nobody to outvote. Votes used to be refused only
+        # for a device's own row; scrape rows have no device_id, which let three
+        # throwaway devices bury a real Woolworths/Coles price for everyone.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "scraped prices are not voted on; report the observation instead",
+        )
 
     existing = session.get(ObservationVote, (observation.id, device.id))
     if existing is None:
@@ -445,6 +444,10 @@ def vote(
         existing.vote = payload.vote
         existing.created_at = utcnow()
 
+    # Sessions run with autoflush=False, so without this the tally below does not
+    # include the vote being cast: a decision would need one more vote than the
+    # threshold says, and the response would report a tally the code ignored.
+    session.flush()
     confirms, disputes = session.execute(
         select(func.count())
         .select_from(ObservationVote)
@@ -455,10 +458,15 @@ def vote(
         .where(ObservationVote.observation_id == observation.id, ObservationVote.vote == -1)
     ).one()[0]
 
+    before = observation.status
     if observation.status == "needs_review" and int(confirms or 0) >= 2:
         observation.status = "accepted"
     if int(disputes or 0) >= 3 and observation.status == "accepted":
         observation.status = "needs_review"
+    if observation.status != before:
+        # The tally is a moderation decision, so the ledger follows it here as
+        # it does for an admin's approve/reject.
+        sync_daily_price(session, observation)
     session.commit()
     return _serialize_one(session, observation)
 

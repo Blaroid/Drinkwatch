@@ -61,3 +61,18 @@ def test_daily_key_covers_the_store_with_nulls_treated_as_one_value() -> None:
     ]
     # NULL is the chain-level row, so two of them for one day must collide.
     assert index.dialect_options["postgresql"]["nulls_not_distinct"] is True
+
+
+def test_table_key_matches_the_index_migration_012_builds() -> None:
+    table = PriceDaily.__table__
+
+    # A declared 3-column primary key is the drift verify_schema() now catches:
+    # 012 drops it because store_id is nullable, so the table has no primary key.
+    assert [column.name for column in table.primary_key.columns] == []
+    # The ORM still needs an identity for the mapper, even though nothing loads
+    # PriceDaily objects.
+    assert [column.name for column in PriceDaily.__mapper__.primary_key] == [
+        "day",
+        "chain_id",
+        "product_id",
+    ]

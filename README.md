@@ -153,6 +153,11 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   instead of pointing at a file that is no longer there.
 * **Backups** - data lives in the `drinkwatch_pgdata` volume:
   `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz`
+* **Restore drill** - a restore that leaves `schema_migrations` empty makes the
+  next boot replay the whole chain, so practise it: restore into an empty
+  database (`gunzip -c backup.sql.gz | psql ...`), run
+  `python scripts/migrate.py`, then start the API so the entrypoint's schema
+  check compares keys and constraints, not just columns.
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
   exercises 30 read/crowd/plan paths. It writes real rows; clean them with the SQL
   in the script header.

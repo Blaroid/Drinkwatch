@@ -64,7 +64,7 @@ def _stub_daily_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     parse, and the daily ledger has its own tests. Folding sightings does not
     depend on it.
     """
-    monkeypatch.setattr(crowd_api, "record_daily_price", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crowd_api, "sync_daily_price", lambda *args, **kwargs: None)
 
 
 @pytest.fixture()

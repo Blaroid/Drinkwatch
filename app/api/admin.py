@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..caffeine import apply_reference_caffeine
+from ..daily import sync_daily_price
 from ..db import get_session
 from ..models import Chain, Device, Listing, Observation, Product, Report, ScrapeRun, Store
 from ..security import require_admin
@@ -350,7 +351,13 @@ def set_observation_status(
     observation = session.get(Observation, observation_id)
     if observation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown observation")
+    before = observation.status
     observation.status = payload.status
+    # Re-approving an accepted row is not a no-op: rows accepted before the
+    # ledger followed the status may still be missing from price_daily, and this
+    # is the moderator's way to repair one.
+    if payload.status == "accepted" or payload.status != before:
+        sync_daily_price(session, observation)
     session.commit()
     return {"id": observation.id, "status": observation.status}
 
