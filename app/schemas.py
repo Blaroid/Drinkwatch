@@ -233,7 +233,13 @@ class BasketCompareIn(BaseModel):
     lon: float = Field(ge=-180, le=180)
     radius_km: float | None = Field(default=None, gt=0)
     max_age_hours: int | None = Field(default=None, ge=1, le=720)
-    include_fuel: bool = False
+    include_fuel: bool = Field(
+        default=True,
+        description=(
+            "rank plans by items + fuel; false reproduces the old price-only ranking, "
+            "with fuel still reported per store"
+        ),
+    )
 
 
 class BasketLineOut(BaseModel):
@@ -252,9 +258,15 @@ class BasketStoreOut(BaseModel):
     store_name: str
     chain_code: str
     suburb: str | None = None
-    distance_km: float
-    total_cents: int
+    distance_km: float = Field(description="straight-line km from origin")
+    drive_distance_km: float = Field(
+        default=0.0, description="round-trip road km after DRIVE_FACTOR, the values fuel uses"
+    )
+    fuel_cost_cents: int = Field(default=0, description="fuel for that round trip")
+    total_cents: int = Field(description="item cost only")
+    total_with_fuel_cents: int = Field(default=0, description="total_cents + fuel_cost_cents")
     total: str
+    total_with_fuel: str = ""
     complete: bool
     items: list[BasketLineOut]
 
@@ -264,7 +276,21 @@ class BasketCompareOut(BaseModel):
     radius_km: float
     stores: list[BasketStoreOut]
     best_single_store: BasketStoreOut | None = None
-    multi_store_total_cents: int | None = None
+    include_fuel: bool = True
+    drive_factor: float = Field(default=1.0, description="road distance = straight line x this")
+    fuel_price_cents_per_l: int | None = Field(
+        default=None, description="ULP price used for the multi-store plan"
+    )
+    fuel_source: str | None = Field(default=None, description="fuelwatch or fallback")
+    multi_store_items_cents: int | None = None
+    multi_store_straight_line_km: float | None = Field(
+        default=None, description="crow-flight tour length, before DRIVE_FACTOR"
+    )
+    multi_store_travel_km: float | None = Field(default=None, description="driven tour length")
+    multi_store_fuel_cost_cents: int | None = None
+    multi_store_total_cents: int | None = Field(
+        default=None, description="items (+ fuel unless include_fuel is false) for the multi-store plan"
+    )
     multi_store_plan: list[dict] = []
     savings_vs_worst_cents: int | None = None
 
@@ -313,7 +339,9 @@ class RoutePlanOut(BaseModel):
     origin: dict
     stops: list[RouteStopOut]
     items_total_cents: int
-    travel_km: float
+    straight_line_km: float | None = Field(default=None, description="crow-flight tour, before DRIVE_FACTOR")
+    travel_km: float = Field(description="driven tour length, the one fuel is charged on")
+    drive_factor: float = Field(default=1.0, description="road distance = straight line x this")
     fuel_price_cents_per_l: int | None = None
     fuel_cost_cents: int
     total_cost_cents: int

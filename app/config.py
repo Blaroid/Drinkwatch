@@ -34,6 +34,7 @@ class Settings:
     fuelwatch_enabled: bool
     vehicle_l_per_100km: float
     fuel_price_cents_per_l: int
+    drive_factor: float
     max_budget_cents: int
     daily_caffeine_limit_mg: int
 
@@ -72,6 +73,10 @@ class Settings:
             fuelwatch_enabled=_flag("FUELWATCH_ENABLED", True),
             vehicle_l_per_100km=float(os.environ.get("VEHICLE_L_PER_100KM", "8.5")),
             fuel_price_cents_per_l=int(os.environ.get("FUEL_PRICE_CENTS_PER_L", "180")),
+            # Streets, river crossings and one-ways make a real drive ~30% longer
+            # than the crow flight haversine measures. Below 1.0 would claim a car
+            # can beat the straight line, so clamp it.
+            drive_factor=max(1.0, float(os.environ.get("DRIVE_FACTOR", "1.3"))),
             max_budget_cents=int(os.environ.get("MAX_BUDGET_CENTS", "20000")),
             daily_caffeine_limit_mg=int(os.environ.get("DAILY_CAFFEINE_LIMIT_MG", "400")),
         )
