@@ -49,7 +49,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch) -> None:
         "_resolve_families",
         lambda session, items: [(item.slug, item.quantity, [product]) for item in items],
     )
-    monkeypatch.setattr(basket, "_bundles_by_store", lambda *args, **kwargs: (per_store, {}))
+    monkeypatch.setattr(basket, "_bundles_by_store", lambda *args, **kwargs: per_store)
     monkeypatch.setattr(basket, "ulp_prices", lambda: dict(PRICES))
 
 

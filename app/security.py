@@ -73,19 +73,32 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def check(self, key: str) -> None:
+        self.charge(key, 1)
+
+    def charge(self, key: str, n: int = 1) -> None:
+        """Take n slots at once, or none at all.
+
+        A batch has to be admitted as one decision. Charging it line by line
+        would spend the hour on the first lines and then 429 the rest, leaving
+        the client with a half-written docket it cannot resubmit; one atomic
+        charge either fits the remaining window or refuses the request before
+        anything is written.
+        """
+        if n <= 0:
+            return
         now = time.monotonic()
         with self._lock:
             bucket = self._hits.setdefault(key, deque())
             while bucket and now - bucket[0] > self.window:
                 bucket.popleft()
-            if len(bucket) >= self.limit:
-                retry = round(self.window - (now - bucket[0]), 1)
+            if len(bucket) + n > self.limit:
+                retry = round(self.window - (now - bucket[0]), 1) if bucket else self.window
                 raise HTTPException(
                     status.HTTP_429_TOO_MANY_REQUESTS,
                     f"rate limit reached; retry in {retry}s",
                     headers={"Retry-After": str(max(1, int(retry)))},
                 )
-            bucket.append(now)
+            bucket.extend([now] * n)
             if len(self._hits) > 20000:  # crude memory guard
                 for stale in [k for k, v in self._hits.items() if not v][:1000]:
                     self._hits.pop(stale, None)
