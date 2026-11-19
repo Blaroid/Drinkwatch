@@ -62,6 +62,40 @@ def wait_for_db(attempts: int = 40, delay: float = 1.5) -> None:
     raise RuntimeError(f"database unavailable after {attempts} attempts: {last_error}")
 
 
+def missing_columns() -> list[str]:
+    """Columns the models expect that the database does not have yet.
+
+    `create_all` only creates missing tables, never missing columns, so a model
+    change without a migration is invisible until a query selects the column and
+    the API 500s. This turns that into a startup failure with a readable list.
+    """
+    from sqlalchemy import inspect
+
+    from . import models
+
+    inspector = inspect(engine)
+    missing: list[str] = []
+    for table in models.Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            missing.append(f"{table.name} (table)")
+            continue
+        present = {column["name"] for column in inspector.get_columns(table.name)}
+        missing.extend(
+            f"{table.name}.{column.name}" for column in table.columns if column.name not in present
+        )
+    return missing
+
+
+def verify_schema() -> None:
+    missing = missing_columns()
+    if missing:
+        raise RuntimeError(
+            "database schema is behind the models; run scripts/migrate.py. Missing: "
+            + ", ".join(missing[:10])
+            + ("" if len(missing) <= 10 else f" (+{len(missing) - 10} more)")
+        )
+
+
 def init_db() -> None:
     """Create tables that do not exist yet.
 

@@ -12,6 +12,8 @@ RUN pip install -r requirements.txt
 COPY app ./app
 COPY scripts ./scripts
 COPY migrations ./migrations
+RUN chmod +x scripts/entrypoint.sh
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# migrations run before anything serves traffic (see scripts/entrypoint.sh)
+CMD ["./scripts/entrypoint.sh"]
