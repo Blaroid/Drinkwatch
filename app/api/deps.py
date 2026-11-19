@@ -386,8 +386,54 @@ def get_product_by_slug(session: Session, slug: str) -> Product:
     return product
 
 
+def find_product_by_barcode(
+    session: Session, barcode: str, normalised: str | None = None
+) -> Product | None:
+    """Resolve a scanned code against every form the catalogue indexes.
+
+    The same can arrives as an EAN-13, a GTIN-14 with a packaging indicator, a
+    UPC-A or a retailer-specific code, so matching products.barcode alone misses
+    codes the barcodes table and normalised_barcode already know. ``normalised``
+    lets a caller that has already run normalize_barcode() reuse the result; a
+    None value means the code has no canonical form, not "not computed".
+    """
+    from ..models import Barcode, Listing
+    from ..scrape.normalize import barcode_variants, normalize_barcode
+
+    if normalised is None:
+        normalised = normalize_barcode(barcode)
+    variants = barcode_variants(barcode)
+    if variants:
+        product = session.scalar(
+            select(Product)
+            .join(Barcode, Barcode.product_id == Product.id)
+            .where(Barcode.barcode.in_(variants))
+        )
+        if product is not None:
+            return product
+    # Only compare normalised_barcode when there is one: `== None` renders as
+    # IS NULL, which would alias any product the backfill never reached.
+    if normalised:
+        product = session.scalar(
+            select(Product).where(
+                (Product.normalised_barcode == normalised) | (Product.barcode == barcode)
+            )
+        )
+    else:
+        product = session.scalar(select(Product).where(Product.barcode == barcode))
+    if product is not None:
+        return product
+    if normalised:
+        listing = session.scalar(
+            select(Listing).where(Listing.barcode.in_(variants + [normalised]))
+        )
+        if listing is not None and listing.product_id is not None:
+            return session.get(Product, listing.product_id)
+    return None
+
+
 def get_product_by_barcode(session: Session, barcode: str) -> Product:
-    product = session.scalar(select(Product).where(Product.barcode == barcode))
+    product = find_product_by_barcode(session, barcode)
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown barcode: {barcode}")
     return product

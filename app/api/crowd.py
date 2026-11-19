@@ -29,7 +29,7 @@ from ..schemas import (
     VoteIn,
 )
 from ..security import current_device, hash_token, new_device_token, read_limiter, write_limiter
-from .deps import format_cents, utcnow
+from .deps import find_product_by_barcode, format_cents, utcnow
 
 router = APIRouter(prefix="/v1", tags=["crowd"])
 
@@ -324,7 +324,7 @@ def _record_observation(payload: ObservationIn, device: Device, session: Session
     if payload.product_slug:
         product = session.scalar(select(Product).where(Product.slug == payload.product_slug))
     elif payload.barcode:
-        product = session.scalar(select(Product).where(Product.barcode == payload.barcode))
+        product = find_product_by_barcode(session, payload.barcode)
     if product is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
