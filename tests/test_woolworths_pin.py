@@ -129,3 +129,33 @@ def test_search_sends_no_store_keys_when_unpinned() -> None:
 
     assert "StoreId" not in client.payloads[0]
     assert "Settlement" not in client.payloads[0]
+
+
+def test_carton_listing_is_read_from_package_size_and_name_together(monkeypatch, wired) -> None:
+    """PackageSize can be the carton total, so the name has to be parsed too.
+
+    Woolworths publishes a carton of 24 x 250mL as PackageSize "6000ML"; reading
+    that field alone made 6000 mL a can size and produced the phantom
+    "v-blue-6000ml" product instead of the 24-pack it is.
+    """
+    client, recorded = wired
+    seen: list[dict] = []
+
+    def _capture(session, **kwargs):
+        seen.append(kwargs)
+        return types.SimpleNamespace(id=3), False
+
+    client.product = {
+        "DisplayName": "V Energy Drink Blue 250mL",
+        "Price": 24.0,
+        "PackageSize": "6000ML",
+        "Stockcode": "456",
+        "IsAvailable": True,
+    }
+    monkeypatch.setattr(woolworths, "settings", _fake_settings(store_id="1234"))
+    monkeypatch.setattr(woolworths, "match_product_woolworths", _capture)
+
+    woolworths.scrape(_session(), keywords=["v energy drink"])
+
+    assert (seen[0]["size_ml"], seen[0]["pack_count"]) == (250, 24)
+    assert recorded[0]["price_scope"] == "chain"
