@@ -11,10 +11,12 @@ from sqlalchemy.orm import Session
 from ..models import Product
 
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L|litres?|liters?)\b")
-PACK_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b")
+PACK_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b", re.IGNORECASE)
 PACK_WORD_RE = re.compile(r"\b(\d{1,2})\s*(?:pack|pk|p)\b", re.IGNORECASE)
 # "(24x Pack)" / "24x carton": count before an "x", no per-unit size.
 PACK_COUNT_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(?:pack|pk|carton|box)\b", re.IGNORECASE)
+# "x4" after the size: the way dockets abbreviate a multipack ("500mL X4").
+PACK_SUFFIX_X_RE = re.compile(r"\b[x×]\s*(\d{1,2})\b", re.IGNORECASE)
 # A token that is just a count ("24", "24x") is never a flavour.
 COUNT_TOKEN_RE = re.compile(r"^\d+x?$")
 
@@ -101,6 +103,40 @@ def parse_pack(text: str | None) -> tuple[int | None, int]:
     return size_ml, max(1, pack_count)
 
 
+def parse_pack_tokens(text: str | None) -> tuple[int | None, int | None]:
+    """Return the size and pack count a line *states*, None where it is silent.
+
+    ``parse_pack`` is for a retailer title, which always describes one SKU, so a
+    missing count means one unit. A receipt line is different: it may name the
+    pack ("4PK") and leave the size to the catalogue, or name the size and say
+    nothing about a pack. Keeping "unstated" separate from "one" is what lets
+    the matcher refuse a 4-pack row for a plain "250mL" line.
+    """
+    if not text:
+        return None, None
+
+    multi = PACK_X_RE.search(text)
+    if multi:
+        return _to_ml(float(multi.group(2)), multi.group(3)), int(multi.group(1))
+
+    carton = PACK_COUNT_X_RE.search(text)
+    if carton:
+        single = SIZE_RE.search(text)
+        size_ml = _to_ml(float(single.group(1)), single.group(2)) if single else None
+        return size_ml, int(carton.group(1))
+
+    single = SIZE_RE.search(text)
+    size_ml = _to_ml(float(single.group(1)), single.group(2)) if single else None
+    word = PACK_WORD_RE.search(text)
+    if word:
+        return size_ml, int(word.group(1))
+    suffix = PACK_SUFFIX_X_RE.search(text)
+    if suffix:
+        return size_ml, int(suffix.group(1))
+    # A stated size with no pack word is one can; nothing stated is unknown.
+    return size_ml, (1 if size_ml is not None else None)
+
+
 def _to_ml(value: float, unit: str) -> int | None:
     unit = unit.lower()
     if unit.startswith("l"):
@@ -178,6 +214,22 @@ def flavour_tokens(text: str) -> set[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", cleaned)
     tokens = {t for t in cleaned.split() if t and not t.isdigit()}
     return {t for t in tokens if t not in NOISE_TOKENS}
+
+
+def receipt_tokens(text: str) -> set[str]:
+    """Flavour tokens from a docket line, with the size and pack removed.
+
+    ``flavour_tokens`` only drops bare digits, so "250ML" and "4PK" survive as
+    tokens and dilute every match (a perfect name scores 0.67). They are the
+    same tokens the matcher uses to filter rows, so they must not also count as
+    flavour evidence.
+    """
+    cleaned = PACK_X_RE.sub(" ", text)
+    cleaned = PACK_COUNT_X_RE.sub(" ", cleaned)
+    cleaned = PACK_WORD_RE.sub(" ", cleaned)
+    cleaned = PACK_SUFFIX_X_RE.sub(" ", cleaned)
+    cleaned = SIZE_RE.sub(" ", cleaned)
+    return flavour_tokens(cleaned)
 
 
 def clean_flavour(name: str, brand: str | None) -> str:

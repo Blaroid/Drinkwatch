@@ -7,7 +7,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.scrape.normalize import barcode_variants, normalize_barcode, parse_pack
+from app.scrape.normalize import (
+    barcode_variants,
+    normalize_barcode,
+    parse_pack,
+    parse_pack_tokens,
+    receipt_tokens,
+)
 
 
 @pytest.mark.parametrize(
@@ -36,6 +42,41 @@ def test_parse_pack(text: str | None, expected: tuple[int | None, int]) -> None:
 
 def test_parse_pack_treats_a_missing_count_as_a_single() -> None:
     assert parse_pack("V Energy 500mL single") == (500, 1)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Nothing stated is not the same as one unit: receipt matching must be
+        # able to tell a bare name from a line that says "250mL".
+        (None, (None, None)),
+        ("", (None, None)),
+        ("Monster Ultra", (None, None)),
+        ("Monster Ultra 250mL", (250, 1)),
+        ("Monster Ultra 4PK", (None, 4)),
+        ("Monster Ultra x4", (None, 4)),
+        ("Monster Ultra 24 pack", (None, 24)),
+        ("Monster Ultra 4 x 500mL", (500, 4)),
+        ("Monster Ultra 500mL x 4", (500, 4)),
+    ],
+)
+def test_parse_pack_tokens_reports_only_what_the_line_states(
+    text: str | None, expected: tuple[int | None, int | None]
+) -> None:
+    assert parse_pack_tokens(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("MONSTER ULTRA 4PK", {"monster", "ultra"}),
+        ("V ENERGY BLUE 250ML", {"v", "blue"}),
+        ("V ENERGY BLUE X4", {"v", "blue"}),
+        ("Monster Aussie Lemonade 500mL x 4", {"monster", "aussie", "lemonade"}),
+    ],
+)
+def test_receipt_tokens_drop_the_size_and_pack(text: str, expected: set[str]) -> None:
+    assert receipt_tokens(text) == expected
 
 
 @pytest.mark.parametrize(

@@ -16,7 +16,7 @@ from sqlalchemy.sql.selectable import Subquery
 from .. import __version__
 from ..config import settings
 from ..db import get_session
-from ..models import Chain, Observation, Product, Store
+from ..models import Chain, Observation, Photo, Product, Store
 from ..schemas import (
     CatalogueOut,
     CatalogueProduct,
@@ -50,6 +50,7 @@ from .deps import (
     product_group_ids,
     utcnow,
 )
+from .photos import photo_url
 
 router = APIRouter(prefix="/v1", tags=["public"])
 
@@ -980,6 +981,15 @@ def observations(
     product_ids = {r.product_id for r, _ in folded}
     stores = {s.id: s for s in session.scalars(select(Store).where(Store.id.in_(store_ids)))}
     prods = {p.id: p for p in session.scalars(select(Product).where(Product.id.in_(product_ids)))}
+    photo_ids = {r.photo_id for r, _ in folded if r.photo_id is not None}
+    photos = (
+        {
+            photo.id: photo
+            for photo in session.scalars(select(Photo).where(Photo.id.in_(photo_ids)))
+        }
+        if photo_ids
+        else {}
+    )
     return [
         {
             "id": row.id,
@@ -998,6 +1008,14 @@ def observations(
             "price_scope": row.price_scope,
             "observed_at": row.observed_at,
             "note": row.note,
+            # The sighting's evidence, so the feed can show the shelf tag the
+            # price came from. Legacy rows may carry only a free-form URL.
+            "photo_token": photos[row.photo_id].token if row.photo_id in photos else None,
+            "photo_url": (
+                photo_url(photos[row.photo_id].token)
+                if row.photo_id in photos
+                else row.photo_url
+            ),
             "sightings": sightings,
         }
         for row, sightings in folded

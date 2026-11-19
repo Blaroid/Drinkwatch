@@ -463,20 +463,42 @@ def reject_product(slug: str, session: Session = Depends(get_session)) -> dict:
 def recent_photos(
     limit: int = Query(default=50, ge=1, le=200), session: Session = Depends(get_session)
 ) -> list[dict]:
+    """List recent uploads, with the sighting each one backs.
+
+    A photo can be attached to more than one sighting; the newest one is
+    reported, because that is the row a reviewer opening the photo from the
+    moderation queue would expect to land on.
+    """
     from ..models import Photo
 
-    return [
-        {
-            "id": photo.id,
-            "token": photo.token,
-            "url": f"/v1/photos/{photo.token}",
-            "uploaded_by": photo.uploaded_by,
-            "bytes": photo.bytes,
-            "created_at": photo.created_at,
-            "pruned_at": photo.pruned_at,
-        }
-        for photo in session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit))
-    ]
+    photos = list(session.scalars(select(Photo).order_by(Photo.id.desc()).limit(limit)))
+    photo_ids = [photo.id for photo in photos]
+    sightings: dict[int, Observation] = {}
+    if photo_ids:
+        for observation in session.scalars(
+            select(Observation)
+            .where(Observation.photo_id.in_(photo_ids))
+            .order_by(Observation.observed_at.desc(), Observation.id.desc())
+        ):
+            sightings.setdefault(observation.photo_id, observation)
+    out = []
+    for photo in photos:
+        linked = sightings.get(photo.id)
+        out.append(
+            {
+                "id": photo.id,
+                "token": photo.token,
+                "url": f"/v1/photos/{photo.token}",
+                "uploaded_by": photo.uploaded_by,
+                "bytes": photo.bytes,
+                "created_at": photo.created_at,
+                "pruned_at": photo.pruned_at,
+                "observation_id": linked.id if linked is not None else None,
+                "product_id": linked.product_id if linked is not None else None,
+                "store_id": linked.store_id if linked is not None else None,
+            }
+        )
+    return out
 
 
 @router.post("/alerts/evaluate", summary="Run the price-alert evaluation now")

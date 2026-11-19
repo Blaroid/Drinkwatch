@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..daily import sync_daily_price
 from ..db import get_session
-from ..models import Chain, Device, Observation, ObservationVote, Product, Store
+from ..models import Chain, Device, Observation, ObservationVote, Photo, Product, Store
 from ..schemas import (
     BatchObservationIn,
     BatchObservationResult,
@@ -23,6 +23,7 @@ from ..schemas import (
     DeviceRegisterIn,
     ObservationIn,
     ObservationOut,
+    ReceiptAlternative,
     ReceiptCandidate,
     ReceiptParseIn,
     ReportIn,
@@ -33,6 +34,7 @@ from ..schemas import (
 )
 from ..security import current_device, hash_token, new_device_token, read_limiter, write_limiter
 from .deps import find_product_by_barcode, format_cents, utcnow
+from .photos import photo_url
 
 router = APIRouter(prefix="/v1", tags=["crowd"])
 
@@ -165,11 +167,23 @@ def _sightings_in_window(session: Session, observation: Observation) -> int:
     return int(total or 0)
 
 
+def _photos_for(session: Session, observations: list[Observation]) -> dict[int, Photo]:
+    """Load the photos attached to these sightings in one query, not per row."""
+    photo_ids = {obs.photo_id for obs in observations if obs.photo_id is not None}
+    if not photo_ids:
+        return {}
+    return {
+        photo.id: photo
+        for photo in session.scalars(select(Photo).where(Photo.id.in_(photo_ids)))
+    }
+
+
 def _serialize(session: Session, observations: list[Observation]) -> list[ObservationOut]:
     if not observations:
         return []
     rows = fold_crowd_sightings(observations)
     ids = [obs.id for obs, _ in rows]
+    photos = _photos_for(session, [obs for obs, _ in rows])
     votes = {
         row.observation_id: (int(row.confirms or 0), abs(int(row.disputes or 0)))
         for row in session.execute(
@@ -179,6 +193,11 @@ def _serialize(session: Session, observations: list[Observation]) -> list[Observ
     out = []
     for obs, sightings in rows:
         item = ObservationOut.model_validate(obs)
+        photo = photos.get(obs.photo_id) if obs.photo_id is not None else None
+        # The token is the durable handle; the stored column is only a legacy
+        # free-form URL from before photos were uploaded through /v1/photos.
+        item.photo_token = photo.token if photo is not None else None
+        item.photo_url = photo_url(photo.token) if photo is not None else obs.photo_url
         confirms, disputes = votes.get(obs.id, (0, 0))
         item.confirms = confirms
         item.disputes = disputes
@@ -376,9 +395,18 @@ def _record_observation(payload: ObservationIn, device: Device, session: Session
 
     photo_id = None
     if payload.photo_token:
-        from ..models import Photo
-
-        photo = session.scalar(select(Photo).where(Photo.token == payload.photo_token))
+        photo = session.scalar(
+            select(Photo).where(
+                Photo.token == payload.photo_token,
+                # A photo is evidence for the sighting its uploader reported; a
+                # token from another device could otherwise be reused to make
+                # someone else's picture look like proof of this price. A pruned
+                # row's bytes are on the backup disk, so attaching it would give
+                # the sighting an image that can only ever answer 410.
+                Photo.uploaded_by == device.id,
+                Photo.pruned_at.is_(None),
+            )
+        )
         if photo is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "unknown photo token")
         photo_id = photo.id
@@ -546,6 +574,12 @@ def submit_batch(
     return results
 
 
+# The lowest Jaccard overlap that still counts as a match; below it two names
+# merely share a brand or a generic word. The same value is the admin's default
+# threshold for the same reason.
+RECEIPT_MATCH_THRESHOLD = 0.34
+
+
 @router.post("/receipts/parse", response_model=list[ReceiptCandidate], summary="Match OCR receipt lines to products")
 def parse_receipt(
     payload: ReceiptParseIn,
@@ -555,8 +589,13 @@ def parse_receipt(
     """The app does the OCR (ML Kit); this matches the text lines to our catalogue.
 
     Returns the best product guess per line so the user only has to confirm.
+    Flavour tokens cannot tell a single can from its 4-pack -- both rows are
+    "Monster Ultra" -- so the line's size and pack tokens are parsed first and
+    only rows whose ``size_ml``/``pack_count`` agree are scored. A line that
+    still ties between rows returns every tied row as an alternative instead of
+    letting the database order pick which pack the price is written against.
     """
-    from ..scrape.normalize import flavour_tokens
+    from ..scrape.normalize import parse_pack_tokens, receipt_tokens
     from sqlalchemy import select as _select
 
     device = current_device(authorization, session=session)
@@ -567,7 +606,7 @@ def parse_receipt(
         session.scalars(_select(Product).where(Product.status != "rejected", Product.is_active.is_(True)))
     )
     index = [
-        (product, flavour_tokens(f"{product.brand} {product.name} {product.variant or ''}"))
+        (product, receipt_tokens(f"{product.brand} {product.name} {product.variant or ''}"))
         for product in products
     ]
 
@@ -585,27 +624,43 @@ def parse_receipt(
             name_part = line[: match.start()].strip()
         if len(name_part) < 3:
             continue
-        wanted = flavour_tokens(name_part)
-        best_product = None
-        best_score = 0.0
+        wanted = receipt_tokens(name_part)
+        size_ml, pack_count = parse_pack_tokens(name_part)
+        scored: list[tuple[float, Product]] = []
         for product, tokens in index:
             if not tokens or not wanted:
                 continue
-            score = len(wanted & tokens) / len(wanted | tokens)
-            if score > best_score:
-                best_score = score
-                best_product = product
+            if size_ml is not None and product.size_ml != size_ml:
+                continue
+            if pack_count is not None and product.pack_count != pack_count:
+                continue
+            scored.append((len(wanted & tokens) / len(wanted | tokens), product))
+        # Deterministic order: equal scores fall back to the slug, so the same
+        # docket always offers the same primary candidate and alternatives.
+        scored.sort(key=lambda pair: (-pair[0], pair[1].slug))
+        best_score = scored[0][0] if scored else 0.0
+        matched: list[tuple[float, Product]] = []
+        if best_score >= RECEIPT_MATCH_THRESHOLD:
+            # Scores are reported to two decimals, so rows that round to the
+            # same value are indistinguishable to the client and are ties.
+            rounded = round(best_score, 2)
+            matched = [pair for pair in scored if round(pair[0], 2) == rounded]
+        best = matched[0][1] if matched else None
         candidates.append(
             ReceiptCandidate(
                 line=line,
                 price_cents=price_cents,
-                product_slug=best_product.slug if best_product and best_score >= 0.34 else None,
-                label=(
-                    f"{best_product.brand} {best_product.name}"
-                    if best_product and best_score >= 0.34
-                    else None
-                ),
+                product_slug=best.slug if best is not None else None,
+                label=f"{best.brand} {best.name}" if best is not None else None,
                 score=round(best_score, 2),
+                alternatives=[
+                    ReceiptAlternative(
+                        product_slug=product.slug,
+                        label=f"{product.brand} {product.name}",
+                        score=round(score, 2),
+                    )
+                    for score, product in matched[1:]
+                ],
             )
         )
     return candidates

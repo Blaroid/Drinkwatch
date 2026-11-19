@@ -167,6 +167,11 @@ class ObservationOut(BaseModel):
     source: str
     price_scope: str
     note: str | None = None
+    # Evidence for the sighting. photo_token is the /v1/photos handle and
+    # photo_url is the URL for the same image; legacy rows that stored only a
+    # client-supplied photo_url carry that URL with no token.
+    photo_token: str | None = None
+    photo_url: str | None = None
     observed_at: datetime
     status: str
     confirms: int = 0
@@ -444,12 +449,24 @@ class ReceiptParseIn(BaseModel):
     text: str = Field(min_length=3, max_length=20000)
 
 
+class ReceiptAlternative(BaseModel):
+    """Another catalogue row that matched a receipt line equally well."""
+
+    product_slug: str
+    label: str
+    score: float
+
+
 class ReceiptCandidate(BaseModel):
     line: str
     price_cents: int | None = None
     product_slug: str | None = None
     label: str | None = None
     score: float = 0.0
+    # Populated only when the line's size/pack tokens still leave more than one
+    # row with the same best score, so the user can pick instead of the
+    # database order deciding.
+    alternatives: list[ReceiptAlternative] = Field(default_factory=list)
 
 
 class LeaderboardEntry(BaseModel):
