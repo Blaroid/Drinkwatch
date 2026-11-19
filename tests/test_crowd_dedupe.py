@@ -26,6 +26,7 @@ from app.models import (
     Device,
     Observation,
     ObservationVote,
+    PriceDaily,
     Product,
     Store,
 )
@@ -51,7 +52,19 @@ TABLES = (
     Device.__table__,
     Observation.__table__,
     ObservationVote.__table__,
+    PriceDaily.__table__,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_daily_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the Postgres-only price_daily upsert out of the SQLite fixture.
+
+    app/daily.py writes with percentile_cont()/ON CONFLICT, which SQLite cannot
+    parse, and the daily ledger has its own tests. Folding sightings does not
+    depend on it.
+    """
+    monkeypatch.setattr(crowd_api, "record_daily_price", lambda *args, **kwargs: None)
 
 
 @pytest.fixture()
