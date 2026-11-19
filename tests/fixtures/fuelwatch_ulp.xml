@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Excerpt of the live FuelWatch ULP feed (Product=1, no Suburb filter),
+  captured 2026-11-19: one Karawara site, the cheapest and dearest Maddington
+  sites, one Perth CBD site, and two Dianella sites whose description omits the
+  phone number. Kept small on purpose; the real feed carries ~943 items across
+  ~500 suburbs.
+-->
+<rss version="2.0">
+  <channel>
+    <title>FuelWatch Prices For All Metro Regions</title>
+    <link>https://www.fuelwatch.wa.gov.au/</link>
+    <description>19/11/2026 - All Metro Regions</description>
+    <language>en-us</language>
+    <item>
+          <title>203.9: Shell Reddy Express Karawara</title>
+          <description>Address: 222 Manning Rd, KARAWARA, Phone: (08) 6247 4350, Open Mon: 06:00-22:00, Tue: 06:00-23:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-22:00, Sun: 07:00-22:00</description>
+          <brand>Reddy Express</brand>
+          <date>2026-11-19</date>
+          <price>203.9</price>
+          <trading-name>Shell Reddy Express Karawara</trading-name>
+          <location>KARAWARA</location>
+          <address>222 Manning Rd</address>
+          <phone>(08) 6247 4350</phone>
+          <latitude>-32.01192700</latitude>
+          <longitude>115.88414500</longitude>
+          <site-features>Open Mon: 06:00-22:00, Tue: 06:00-23:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-22:00, Sun: 07:00-22:00</site-features>
+          <restrictions></restrictions>
+        </item>
+    <item>
+          <title>189.5: Caltex Maddington Truck Stop</title>
+          <description>Address: 18 Orchard Rd, MADDINGTON, Phone: (08) 9459 1919, Site features: Fuel Cards ATM Toilets Bottled Gas Trailer Hire EFTPOS Restaurant Air Ice Pumped AdBlue Truck Friendly, Open 24 hours</description>
+          <brand>Caltex</brand>
+          <date>2026-11-19</date>
+          <price>189.5</price>
+          <trading-name>Caltex Maddington Truck Stop</trading-name>
+          <location>MADDINGTON</location>
+          <address>18 Orchard Rd</address>
+          <phone>(08) 9459 1919</phone>
+          <latitude>-32.03520700</latitude>
+          <longitude>115.99919500</longitude>
+          <site-features>Fuel Cards ATM Toilets Bottled Gas Trailer Hire EFTPOS Restaurant Air Ice Pumped AdBlue Truck Friendly, Open 24 hours</site-features>
+          <restrictions></restrictions>
+        </item>
+    <item>
+          <title>209.9: EG Ampol Maddington West</title>
+          <description>Address: 207 Burslem Dr, MADDINGTON, Open 24 hours</description>
+          <brand>EG Ampol</brand>
+          <date>2026-11-19</date>
+          <price>209.9</price>
+          <trading-name>EG Ampol Maddington West</trading-name>
+          <location>MADDINGTON</location>
+          <address>207 Burslem Dr</address>
+          <phone></phone>
+          <latitude>-32.04932400</latitude>
+          <longitude>115.97750200</longitude>
+          <site-features>Open 24 hours</site-features>
+          <restrictions></restrictions>
+        </item>
+    <item>
+          <title>203.9: Shell Reddy Express Perth</title>
+          <description>Address: 480 William St, PERTH, Phone: (08) 6157 5658, Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-23:00, Sun: 07:00-22:00</description>
+          <brand>Reddy Express</brand>
+          <date>2026-11-19</date>
+          <price>203.9</price>
+          <trading-name>Shell Reddy Express Perth</trading-name>
+          <location>PERTH</location>
+          <address>480 William St</address>
+          <phone>(08) 6157 5658</phone>
+          <latitude>-31.94095300</latitude>
+          <longitude>115.86390400</longitude>
+          <site-features>Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-23:00, Sun: 07:00-22:00</site-features>
+          <restrictions></restrictions>
+        </item>
+    <item>
+          <title>183.9: Shell Express Dianella</title>
+          <description>Address: 67 Walter Rd West, DIANELLA, Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 07:00-21:00, Sun: 07:00-21:00</description>
+          <brand>Shell Express</brand>
+          <date>2026-11-19</date>
+          <price>183.9</price>
+          <trading-name>Shell Express Dianella</trading-name>
+          <location>DIANELLA</location>
+          <address>67 Walter Rd West</address>
+          <phone></phone>
+          <latitude>-31.90580100</latitude>
+          <longitude>115.88270000</longitude>
+          <site-features>Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 07:00-21:00, Sun: 07:00-21:00</site-features>
+          <restrictions>Unmanned site (credit card charges may apply); </restrictions>
+        </item>
+    <item>
+          <title>209.9: EG Ampol Dianella</title>
+          <description>Address: 372 Grand Prom, DIANELLA, Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-22:00, Sun: 07:00-21:00</description>
+          <brand>EG Ampol</brand>
+          <date>2026-11-19</date>
+          <price>209.9</price>
+          <trading-name>EG Ampol Dianella</trading-name>
+          <location>DIANELLA</location>
+          <address>372 Grand Prom</address>
+          <phone></phone>
+          <latitude>-31.89674000</latitude>
+          <longitude>115.87186500</longitude>
+          <site-features>Open Mon: 06:00-22:00, Tue: 06:00-22:00, Wed: 06:00-22:00, Thu: 06:00-22:00, Fri: 06:00-22:00, Sat: 06:00-22:00, Sun: 07:00-21:00</site-features>
+          <restrictions></restrictions>
+        </item>
+  </channel>
+</rss>
