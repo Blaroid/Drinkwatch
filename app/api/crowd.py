@@ -305,7 +305,17 @@ def submit_observation(
 ) -> ObservationOut:
     device = current_device(authorization, session=session)
     write_limiter.check(f"obs:{device.id}")
+    return _record_observation(payload, device, session)
 
+
+def _record_observation(payload: ObservationIn, device: Device, session: Session) -> ObservationOut:
+    """Validate and store one sighting for an already-charged caller.
+
+    The hour's quota is charged by the HTTP handlers, not here: a batch is one
+    act of reporting and has to be admitted in one decision, while a single
+    sighting costs one slot. Everything else -- validation, outlier triage,
+    idempotency -- stays per item, so one bad line fails only that line.
+    """
     store = session.get(Store, payload.store_id)
     if store is None or not store.is_active:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown store")
@@ -501,11 +511,19 @@ def submit_batch(
     authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
 ) -> list[BatchObservationResult]:
-    """Same validation as /v1/observations, one row per item, per-item errors."""
+    """Same validation as /v1/observations, one row per item, per-item errors.
+
+    The hourly quota is charged once for the whole docket, sized to its line
+    count. Charging per line made a receipt spend the device's entire hour: a
+    50-line docket took 83% of it, the next receipt 429'd line by line, and the
+    user was left with a half-submitted docket they could not finish.
+    """
+    device = current_device(authorization, session=session)
+    write_limiter.charge(f"obs:{device.id}", n=len(payload.items))
     results: list[BatchObservationResult] = []
     for index, item in enumerate(payload.items):
         try:
-            saved = submit_observation(item, authorization=authorization, session=session)
+            saved = _record_observation(item, device, session)
             results.append(
                 BatchObservationResult(index=index, status=saved.status, observation_id=saved.id)
             )
