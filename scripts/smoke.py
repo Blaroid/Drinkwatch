@@ -138,8 +138,14 @@ def main(argv: list[str] | None = None) -> int:
     search = client.get("/v1/stores/search", params={"q": "spud", "lat": LAT, "lon": LON}).json()
     check("store text search", isinstance(search, list) and len(search) > 0, str(search)[:100])
 
+    # The barcode index is intentionally empty (purged 2026-11-19), so this checks
+    # the endpoint contract rather than that a particular code resolves.
     known = client.get("/v1/barcode/19342866000496").json()
-    check("barcode resolves a GTIN-14", known["found"] and known["product"]["slug"], str(known)[:120])
+    check(
+        "barcode lookup answers with a product or a hint",
+        (known["found"] and known.get("product")) or bool(known.get("pending_hint")),
+        str(known)[:120],
+    )
 
     random_barcode = str(random.randint(10**11, 10**12 - 1))
     unknown = client.get(f"/v1/barcode/{random_barcode}").json()

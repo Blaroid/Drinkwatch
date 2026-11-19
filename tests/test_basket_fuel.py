@@ -176,3 +176,28 @@ def test_http_response_serialises_the_fuel_fields(monkeypatch: pytest.MonkeyPatc
     assert body["best_single_store"]["store_id"] == NEAR.id
     assert body["best_single_store"]["distance_km"] == 0.1
     assert body["best_single_store"]["drive_distance_km"] > 0
+
+
+def test_fuel_quote_matches_a_finer_grained_store_suburb() -> None:
+    # Store suburbs come from OSM place nodes: "Perth Cultural Centre" has no
+    # station, but "PERTH" does, and that is the pump the driver actually uses.
+    rates, cost, source = basket._fuel_quote(1.0, ["Perth Cultural Centre"], {"PERTH": 204})
+    assert (rates, source) == (204, "fuelwatch")
+    assert cost == pricing.fuel_cost_cents(1.0, 204)
+
+
+def test_fuel_quote_falls_back_to_the_state_median_not_a_constant() -> None:
+    rates, cost, source = basket._fuel_quote(1.0, ["Waterford"], {"PERTH": 210, "SUBIACO": 190})
+    assert (rates, source) == (210, "state-median")
+    assert cost == pricing.fuel_cost_cents(1.0, 210)
+
+
+def test_fuel_quote_uses_the_configured_price_when_the_feed_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    # Settings is frozen, so swap the module's instance instead of the field.
+    monkeypatch.setattr(basket, "settings", replace(settings, fuel_price_cents_per_l=183))
+    rates, _, source = basket._fuel_quote(1.0, ["Waterford"], {})
+    assert (rates, source) == (183, "fallback")

@@ -82,7 +82,41 @@ def ulp_prices(product: int = 1) -> dict[str, int]:
     return prices
 
 
-def price_for_suburb(suburb: str | None) -> int | None:
-    if not suburb:
+def lookup_suburb(prices: dict[str, int], suburb: str | None) -> int | None:
+    """Cheapest ULP for a suburb name, tolerating the two vocabularies.
+
+    FuelWatch keys are station localities ("PERTH", "KARAWARA"); our store
+    suburbs come from OpenStreetMap place nodes and are sometimes more specific
+    ("PERTH CULTURAL CENTRE") or a place with no station of its own
+    ("WATERFORD"). Exact match first, then containment either way, taking the
+    median of the candidates so one unusually cheap servo cannot set the price
+    for a whole area. Unknown places return None and the caller decides.
+    """
+    if not suburb or not prices:
         return None
-    return ulp_prices().get(suburb.strip().upper())
+    key = suburb.strip().upper()
+    if key in prices:
+        return prices[key]
+    candidates = sorted(
+        prices[name] for name in prices if name in key or key in name
+    )
+    if not candidates:
+        return None
+    return candidates[len(candidates) // 2]
+
+
+def state_median_cents(prices: dict[str, int] | None = None) -> int | None:
+    """Median ULP across the whole feed.
+
+    Better than a hard-coded fallback for a store whose suburb has no station:
+    the number moves with the market instead of being stuck at whatever the
+    config said when it was written.
+    """
+    values = sorted((prices if prices is not None else ulp_prices()).values())
+    if not values:
+        return None
+    return values[len(values) // 2]
+
+
+def price_for_suburb(suburb: str | None) -> int | None:
+    return lookup_suburb(ulp_prices(), suburb)

@@ -32,7 +32,7 @@ from ..schemas import (
     RoutePlanOut,
     RouteStopOut,
 )
-from ..scrape.fuelwatch import ulp_prices
+from ..scrape.fuelwatch import lookup_suburb, state_median_cents, ulp_prices
 from .deps import clamp_radius, default_since, format_cents, nearby_stores, utcnow
 
 router = APIRouter(prefix="/v1", tags=["plans"])
@@ -100,12 +100,18 @@ def _fuel_quote(
     """
     fuel_cents_per_l: int | None = None
     for suburb in suburbs:
-        if not suburb:
-            continue
-        price = prices.get(suburb.strip().upper())
+        # Store suburbs come from OpenStreetMap place nodes and do not always
+        # match a FuelWatch locality exactly ("Perth Cultural Centre" vs
+        # "PERTH"), so the lookup widens to containment before giving up.
+        price = lookup_suburb(prices, suburb)
         if price:
             fuel_cents_per_l = price if fuel_cents_per_l is None else min(fuel_cents_per_l, price)
     if fuel_cents_per_l is None:
+        # A plan whose shops have no station nearby still deserves a live number:
+        # the state median from the same feed beats a hard-coded 180c/L.
+        median = state_median_cents(prices)
+        if median is not None:
+            return median, fuel_cost_cents(travel_km, median), "state-median"
         fuel_cents_per_l = settings.fuel_price_cents_per_l
         return fuel_cents_per_l, fuel_cost_cents(travel_km, fuel_cents_per_l), "fallback"
     return fuel_cents_per_l, fuel_cost_cents(travel_km, fuel_cents_per_l), "fuelwatch"

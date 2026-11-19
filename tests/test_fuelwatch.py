@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.scrape import fuelwatch
+from app.scrape.fuelwatch import lookup_suburb, state_median_cents
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fuelwatch_ulp.xml"
 
@@ -130,3 +131,30 @@ def test_ulp_prices_is_cached_between_plan_requests(monkeypatch) -> None:
 
     assert len(calls) == 1
     assert second is first
+
+
+def test_store_suburb_matches_a_more_general_station_locality() -> None:
+    prices = {"PERTH": 204, "SUBIACO": 190}
+    # OSM place nodes are finer-grained than station localities.
+    assert lookup_suburb(prices, "Perth Cultural Centre") == 204
+
+
+def test_store_suburb_matches_a_more_specific_station_locality() -> None:
+    prices = {"PERTH AIRPORT": 209}
+    assert lookup_suburb(prices, "Perth") == 209
+
+
+def test_unknown_suburb_returns_none() -> None:
+    assert lookup_suburb({"PERTH": 204}, "Waterford") is None
+
+
+def test_ambiguous_containment_takes_the_median_not_the_cheapest() -> None:
+    # "PERTH AIRPORT WEST" contains both localities; the cheap one must not set
+    # the price for the whole area.
+    prices = {"PERTH": 210, "PERTH AIRPORT": 190}
+    assert lookup_suburb(prices, "Perth Airport West") == 210
+
+
+def test_state_median_is_the_middle_of_the_feed() -> None:
+    assert state_median_cents({"A": 180, "B": 204, "C": 260}) == 204
+    assert state_median_cents({}) is None
