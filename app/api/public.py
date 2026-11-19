@@ -31,11 +31,13 @@ from ..schemas import (
 from .crowd import fold_crowd_sightings
 from .deps import (
     age_hours,
+    bounding_box,
     clamp_radius,
     default_since,
     format_cents,
     get_product_by_barcode,
     get_product_by_slug,
+    haversine_km,
     latest_prices,
     nearby_stores,
     product_group_ids,
@@ -798,20 +800,33 @@ def stores_search(
     """
     needle = f"%{q.strip().lower()}%"
     prefix = f"{q.strip().lower()}%"
-    rows = list(
-        session.scalars(
-            select(Store)
-            .join(Chain, Chain.id == Store.chain_id)
-            .where(
-                Store.is_active.is_(True),
-                func.lower(Store.name).like(needle)
-                | func.lower(func.coalesce(Store.suburb, "")).like(needle)
-                | func.coalesce(Store.postcode, "").like(needle)
-                | func.lower(Chain.name).like(needle),
-            )
-            .limit(300)
+    conditions = [
+        Store.is_active.is_(True),
+        func.lower(Store.name).like(needle)
+        | func.lower(func.coalesce(Store.suburb, "")).like(needle)
+        | func.coalesce(Store.postcode, "").like(needle)
+        | func.lower(Chain.name).like(needle),
+    ]
+    bounded = lat is not None and lon is not None and radius_km is not None
+    if bounded:
+        radius = clamp_radius(radius_km)
+        lat_min, lat_max, lon_min, lon_max = bounding_box(lat, lon, radius)
+        conditions.extend(
+            [
+                Store.lat.is_not(None),
+                Store.lon.is_not(None),
+                Store.lat.between(lat_min, lat_max),
+                Store.lon.between(lon_min, lon_max),
+            ]
         )
-    )
+    stmt = select(Store).join(Chain, Chain.id == Store.chain_id).where(*conditions)
+    if not bounded:
+        # Without a radius the pre-cut still bounds an unrestricted text scan.
+        # With one, the bounding box is the bound: a row LIMIT here would cut
+        # by heap order before the distance filter, dropping stores inside the
+        # radius in favour of arbitrary rows.
+        stmt = stmt.limit(300)
+    rows = list(session.scalars(stmt))
 
     def rank(store: Store) -> tuple:
         name = (store.name or "").lower()
@@ -826,8 +841,6 @@ def stores_search(
 
     ranked = sorted(rows, key=rank)
     if lat is not None and lon is not None:
-        from .deps import haversine_km
-
         radius = clamp_radius(radius_km) if radius_km else None
         annotated = []
         for store in ranked:

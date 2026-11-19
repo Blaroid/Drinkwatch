@@ -29,6 +29,17 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(math.sqrt(a))
 
 
+def bounding_box(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
+    """Latitude/longitude bounds that can serve as a cheap prefilter.
+
+    A degree of longitude shrinks towards the poles, so this box is slightly
+    generous; callers still apply haversine for the exact radius.
+    """
+    dlat = radius_km / 111.0
+    dlon = radius_km / max(0.01, 111.0 * math.cos(math.radians(lat)))
+    return lat - dlat, lat + dlat, lon - dlon, lon + dlon
+
+
 def nearby_stores(
     session: Session,
     lat: float,
@@ -38,18 +49,17 @@ def nearby_stores(
     limit: int = 300,
 ) -> list[tuple[Store, float]]:
     """Stores within radius, nearest first."""
-    dlat = radius_km / 111.0
-    dlon = radius_km / max(0.01, 111.0 * math.cos(math.radians(lat)))
-    stmt = (
-        select(Store)
-        .where(
-            Store.is_active.is_(True),
-            Store.lat.is_not(None),
-            Store.lon.is_not(None),
-            Store.lat.between(lat - dlat, lat + dlat),
-            Store.lon.between(lon - dlon, lon + dlon),
-        )
-        .limit(limit * 4)
+    lat_min, lat_max, lon_min, lon_max = bounding_box(lat, lon, radius_km)
+    # No SQL LIMIT: Postgres cannot sort by the haversine distance here, and a
+    # row limit applied before the distance filter returns whichever rows the
+    # heap offers first, so closer stores were being dropped. The bounding box
+    # already bounds the scan; `limit` is applied after sorting below.
+    stmt = select(Store).where(
+        Store.is_active.is_(True),
+        Store.lat.is_not(None),
+        Store.lon.is_not(None),
+        Store.lat.between(lat_min, lat_max),
+        Store.lon.between(lon_min, lon_max),
     )
     if chain_code:
         from ..models import Chain
