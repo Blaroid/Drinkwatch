@@ -22,35 +22,41 @@ def safe_run(codes: list[str]) -> None:
         log.exception("scheduled scrape failed for %s", codes)
 
 
-def start_scheduler() -> BackgroundScheduler:
-    scheduler = BackgroundScheduler(timezone=TIMEZONE)
+def register_jobs(scheduler: BackgroundScheduler, scrape_enabled: bool) -> None:
+    """Add the jobs this deployment wants to a (not yet started) scheduler.
 
-    # SpudShed: per-store sites, cheap to poll, prices change weekly.
-    scheduler.add_job(
-        safe_run,
-        IntervalTrigger(hours=6),
-        args=[["spudshed"]],
-        id="spudshed",
-        max_instances=1,
-        coalesce=True,
-    )
-    # Woolworths / Coles: national catalogue, refresh overnight.
-    scheduler.add_job(
-        safe_run,
-        CronTrigger(hour=5, minute=20, timezone=TIMEZONE),
-        args=[["woolworths"]],
-        id="woolworths",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        safe_run,
-        CronTrigger(hour=5, minute=45, timezone=TIMEZONE),
-        args=[["coles"]],
-        id="coles",
-        max_instances=1,
-        coalesce=True,
-    )
+    SCRAPE_ENABLED only governs scraping. An operator who turns it off to stop
+    hitting the retailers still wants alerts on crowd-sighted prices and the
+    weekly digest, which is the case the timers exist for; registering scrape
+    jobs while scraping is off would only add runs that run_chains() skips.
+    """
+    if scrape_enabled:
+        # SpudShed: per-store sites, cheap to poll, prices change weekly.
+        scheduler.add_job(
+            safe_run,
+            IntervalTrigger(hours=6),
+            args=[["spudshed"]],
+            id="spudshed",
+            max_instances=1,
+            coalesce=True,
+        )
+        # Woolworths / Coles: national catalogue, refresh overnight.
+        scheduler.add_job(
+            safe_run,
+            CronTrigger(hour=5, minute=20, timezone=TIMEZONE),
+            args=[["woolworths"]],
+            id="woolworths",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            safe_run,
+            CronTrigger(hour=5, minute=45, timezone=TIMEZONE),
+            args=[["coles"]],
+            id="coles",
+            max_instances=1,
+            coalesce=True,
+        )
     # Sunday evening: "where should I buy my cans this week".
     scheduler.add_job(
         safe_digest,
@@ -67,6 +73,11 @@ def start_scheduler() -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
+
+
+def start_scheduler(scrape_enabled: bool = True) -> BackgroundScheduler:
+    scheduler = BackgroundScheduler(timezone=TIMEZONE)
+    register_jobs(scheduler, scrape_enabled)
     scheduler.start()
     return scheduler
 

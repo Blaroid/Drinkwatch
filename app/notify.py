@@ -29,9 +29,11 @@ log = logging.getLogger(__name__)
 QUIET_PERIOD = timedelta(hours=24)
 FRESH_WINDOW = timedelta(hours=48)
 MEDIAN_WINDOW_DAYS = 30
-# Cap on stores examined per alert per run. The timer runs this often, so an
-# unbounded scan of every store in the state is not worth it; a radius narrows
-# the list, it never raises this ceiling.
+# Ceiling on stores examined by a *radius* alert per run, applied after the
+# exact haversine sort so the nearest stores survive. A radius is the only case
+# that can return more than the state holds, and an alert without one must see
+# every active store: 544 rows is not a scanning problem, and quietly dropping
+# the tail made ~26% of the state unable to fire (audit #34 item 5).
 STORE_SCAN_LIMIT = 400
 LOCAL_TZ = ZoneInfo("Australia/Perth")
 
@@ -150,7 +152,9 @@ def _alert_stores(session: Session, alert: PriceAlert) -> list[Store]:
     if alert.chain_code:
         stmt = stmt.join(Chain).where(Chain.code == alert.chain_code)
     if alert.lat is None or alert.lon is None or alert.radius_km is None:
-        return list(session.scalars(stmt.limit(STORE_SCAN_LIMIT)))
+        # No radius means "every active store", as API.md promises. Order by id
+        # only so a run is reproducible; there is no cap to select against.
+        return list(session.scalars(stmt.order_by(Store.id)))
 
     # Cheap bounding box in SQL, exact haversine on the rows that come back: one
     # indexed range scan beats pulling every active store into Python to measure it.
@@ -171,7 +175,46 @@ def _alert_stores(session: Session, alert: PriceAlert) -> list[Store]:
     return nearby[:STORE_SCAN_LIMIT]
 
 
+# One statement both claims the alert and re-checks the quiet period. Two
+# evaluations that read the same old last_notified_at cannot both queue a
+# notification: the second blocks on the row lock until the first commits, then
+# re-evaluates the WHERE against the committed value and claims nothing. Compare
+# with an advisory lock, which would also need a transaction held across the
+# whole scan; the claim only serialises the alert that is actually about to fire.
+_CLAIM_SQL = text(
+    """
+    update price_alerts
+       set last_notified_at = :now
+     where id = :alert_id
+       and (last_notified_at is null or last_notified_at < :cutoff)
+    returning id
+    """
+)
+
+
+def _claim_alert(session: Session, alert_id: int, now: datetime) -> bool:
+    """Mark the alert as notified now, if no one else has inside the quiet period.
+
+    Returns False when another evaluation already claimed it, which is the
+    signal to skip queueing. The in-memory PriceAlert is deliberately left alone:
+    the committed row is the authority and the caller does not read the
+    attribute again.
+    """
+    claimed = session.execute(
+        _CLAIM_SQL,
+        {"now": now, "cutoff": now - QUIET_PERIOD, "alert_id": alert_id},
+    ).scalar_one_or_none()
+    return claimed is not None
+
+
 def evaluate_alerts(session: Session, limit: int = 500) -> int:
+    """Queue at most one notification per alert, even if runs overlap.
+
+    The timer, the post-scrape call and the admin endpoint can all be inside
+    this function at once. The quiet-period check below is only a fast path over
+    rows this session loaded; the per-alert claim before the insert is what makes
+    double-notification impossible.
+    """
     alerts = list(
         session.scalars(
             select(PriceAlert).where(PriceAlert.is_active.is_(True)).order_by(PriceAlert.id).limit(limit)
@@ -274,6 +317,11 @@ def evaluate_alerts(session: Session, limit: int = 500) -> int:
             payload["median_cents"] = median_cents
             payload["drop_percent"] = round(best["drop_percent"], 1)
 
+        # Claim before queueing. A failed claim means a concurrent run already
+        # queued this alert, so adding our copy would be the duplicate.
+        if not _claim_alert(session, alert.id, now):
+            continue
+
         session.add(
             Notification(
                 device_id=alert.device_id,
@@ -283,7 +331,9 @@ def evaluate_alerts(session: Session, limit: int = 500) -> int:
                 payload=payload,
             )
         )
-        alert.last_notified_at = now
+        # Commit per alert: it releases the claimed row immediately for the next
+        # run instead of holding every claim until the whole batch is done.
+        session.commit()
         created += 1
 
     session.commit()
