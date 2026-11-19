@@ -243,7 +243,9 @@ Stores that cannot cover every item come back with `complete: false` and sort la
          "daily_limit_mg": 400, "exceeds_daily_limit": true, "stores_used": 1}
 
 Exact integer knapsack (bundles are indivisible). Budget above `MAX_BUDGET_CENTS`
-returns 422.
+returns 422. `mode=single_store` prices every shop on its own and returns the best
+one-shop plan (the nearest shop wins a tie), so every item is buyable in one trip;
+`mode=multi_store` may split the budget across shops.
 
     GET /v1/plan/route?items=monster-ultra-500ml:4,v-blue-250ml:2&lat=&lon=&radius_km=
 
