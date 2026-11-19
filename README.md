@@ -111,7 +111,7 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
       scrape/              spudshed, woolworths, coles, iga, fuelwatch, normalize, runner
     scripts/               seed, migrate, backfill, clean_names, photos-sync, smoke
     migrations/            SQL migrations, applied in filename order
-    docs/                  screenshots
+    photos/                uploaded price-tag images, served by /v1/photos
 
 ## Configuration
 
@@ -140,6 +140,13 @@ a dump of the old table is in `backups/barcodes-*.sql`. New codes arrive from
 crowd scans (`POST /v1/products/pending`) and from the next scrape of a chain
 that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
 
+The rows the smoke test left behind were purged on 2026-11-19 with
+`scripts/purge_smoke.py --apply` (a dry run by default): a `smoke-test` device
+per run (the crowd leaderboard's top three), its sightings, photos and alerts,
+and the pending "Smoke Test" can in the review queue. From now on every run's
+rows carry the markers in `scripts/smoke.py`, so `smoke.py --cleanup` finds the
+ones from the current run.
+
 ## Operations
 
 * **Migrations** - `docker compose exec -T api python scripts/migrate.py`. Applied
@@ -151,16 +158,25 @@ that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
   copies after 14 days (`scripts/photos-sync.sh`). Before a file is removed the sync
   script marks its `photos` row `pruned_at`, so `/v1/photos/{token}` answers 410
   instead of pointing at a file that is no longer there.
-* **Backups** - data lives in the `drinkwatch_pgdata` volume:
-  `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backup.sql.gz`
+* **Backups** - data lives in the `drinkwatch_pgdata` volume. Dump into the
+  gitignored `backups/` directory (the same files are mirrored to the redmax
+  backup disk):
+  `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backups/backup-$(date +%F).sql.gz`
 * **Restore drill** - a restore that leaves `schema_migrations` empty makes the
-  next boot replay the whole chain, so practise it: restore into an empty
-  database (`gunzip -c backup.sql.gz | psql ...`), run
-  `python scripts/migrate.py`, then start the API so the entrypoint's schema
-  check compares keys and constraints, not just columns.
+  next boot replay the whole chain, so practise it against the day's dump in a
+  scratch database, never the live one:
+  `docker compose exec -T db createdb -U drinkwatch restore_drill`, then
+  `gunzip -c backups/backup-2026-11-19.sql.gz | docker compose exec -T db psql -U drinkwatch -d restore_drill`,
+  then run `scripts/migrate.py` with `DATABASE_URL` pointed at `restore_drill`
+  and start the API so the entrypoint's schema check compares keys and
+  constraints, not just columns.
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
-  exercises 30 read/crowd/plan paths. It writes real rows; clean them with the SQL
-  in the script header.
+  exercises 30 read/crowd/plan paths. It writes real rows: a device, crowd
+  sightings, a photo and a pending product, tagged with the markers in the
+  script header (device name and version, note prefix, product title).
+  `python scripts/smoke.py --cleanup` reports them and `--cleanup --apply`
+  deletes them, along with the `price_daily` rows they wrote;
+  `python scripts/purge_smoke.py --apply` is the same cleanup for a backlog.
 
 ## Data model notes
 
@@ -189,8 +205,17 @@ change bumps it and lands as one commit:
     0.1.1  clean product names ("Original" fallback)
     0.2.0  typo-tolerant product search (pg_trgm)
     0.3.1  /v1/widget?suggest for "end of your list" suggestions
+    0.3.2  install page explains self-updating
     0.3.3  price_daily keeps a row per store, plus the chain-level aggregate
-    docs   README / API.md only, no version bump
+    0.5.0  freshness, state, fuel, caffeine, crowd and widget fixes (issue #1)
+    0.5.1  migrations run before serving; boot refuses a schema mismatch
+    0.5.2  barcode index purged (retailer and test codes resolved to the wrong can)
+    0.6.0  FuelWatch feed, receipt quota, photo streaming, pack labels, widget scopes
+    0.6.1  FuelWatch suburb matching, with a state-median fuel fallback
+    0.7.0  bundles, nearby order, brand-only matching, barcode index, migration replay,
+           moderation -> price_daily, seed_spudshed guard
+
+Docs-only changes (README / API.md) land without a version bump.
 
 ## Legal and etiquette
 
