@@ -11,10 +11,12 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 
-from app.models import PriceAlert, Store
-from app.notify import STORE_SCAN_LIMIT, _drop_percent, _in_radius, _matches, _median_window, _alert_stores
+from app.models import Chain, PriceAlert, Store
+from app.notify import _drop_percent, _in_radius, _matches, _median_window, _alert_stores
 
 
 def _alert(**overrides: object) -> PriceAlert:
@@ -131,14 +133,55 @@ def test_radius_excludes_a_store_without_coordinates() -> None:
 # ---------- store query ----------
 
 
-def test_store_query_caps_the_scan_when_there_is_no_radius() -> None:
+def test_store_query_without_a_radius_is_uncapped_and_deterministic() -> None:
+    # Evidence case from the audit: 544 active stores, STORE_SCAN_LIMIT=400 and
+    # no ORDER BY, so 144 of them could never fire for the four live alerts
+    # without a radius. The scan now covers every active store; the ordering is
+    # only there to keep a run reproducible.
     session = _RecordingSession([_store(-31.95, 115.86)])
     _alert_stores(session, _alert(max_price_cents=250))
     sql = _sql(session).upper()
-    assert "LIMIT" in sql
-    assert str(STORE_SCAN_LIMIT) in sql
-    # No radius: no coordinate predicates, so the scan is the old one, capped.
+    assert "LIMIT" not in sql
+    assert "ORDER BY STORES.ID" in sql
+    # No radius: no coordinate predicates either.
     assert "BETWEEN" not in sql
+
+
+def test_no_radius_scan_reaches_every_active_store() -> None:
+    # The cap is gone, not just raised: the 544th active store must be visible
+    # to an alert without a radius, while inactive stores stay out.
+    engine = create_engine("sqlite://")
+    Chain.__table__.create(engine)
+    Store.__table__.create(engine)
+    with Session(engine, autoflush=False, future=True) as db:
+        db.add(Chain(id=1, code="coles", name="Coles", kind="supermarket"))
+        db.flush()
+        for index in range(544):
+            db.add(
+                Store(
+                    chain_id=1,
+                    name=f"Store {index}",
+                    external_ref=f"store-{index}",
+                    is_active=True,
+                )
+            )
+        for index in range(6):
+            db.add(
+                Store(
+                    chain_id=1,
+                    name=f"Closed {index}",
+                    external_ref=f"closed-{index}",
+                    is_active=False,
+                )
+            )
+        db.commit()
+
+        found = _alert_stores(db, _alert(max_price_cents=250))
+
+    assert len(found) == 544
+    assert [store.id for store in found] == sorted(store.id for store in found)
+    # The store the old cap dropped: last inserted, well past row 400.
+    assert found[-1].name == "Store 543"
 
 
 def test_store_query_applies_both_radius_and_chain_filter() -> None:

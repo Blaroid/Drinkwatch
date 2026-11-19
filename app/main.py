@@ -31,11 +31,17 @@ async def lifespan(app: FastAPI):
     log.info("schema ready")
 
     scheduler = None
-    if settings.scheduler_enabled and settings.scrape_enabled:
+    # The scheduler owns the alert and digest timers as well as the scrapers, so
+    # only the scraping jobs follow SCRAPE_ENABLED. Stopping scrapes must not
+    # stop alerts on crowd prices (audit #34 item 14).
+    if settings.scheduler_enabled:
         from .scheduler import start_scheduler
 
-        scheduler = start_scheduler()
-        log.info("scrape scheduler started")
+        scheduler = start_scheduler(settings.scrape_enabled)
+        log.info(
+            "scheduler started (scrape jobs %s)",
+            "enabled" if settings.scrape_enabled else "disabled",
+        )
 
     yield
 

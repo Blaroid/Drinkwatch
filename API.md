@@ -331,8 +331,13 @@ There are two triggers and either is enough: `max_price_cents` (an absolute
 ceiling) and `min_drop_percent` (a fall of at least that many percent below the
 product's 30-day median in that chain). `lat`/`lon`/`radius_km` — all three or
 none — limit evaluation to stores within that radius; without them an alert
-scans every active store, as it always did. `chain_code` and `store_id` narrow
+scans every active store, with no cap. `chain_code` and `store_id` narrow
 the scan further and still work alongside the radius.
+
+Evaluation is safe to start from several places at once (the 30-minute timer,
+the call after each scrape, `POST /v1/admin/alerts/evaluate`): an alert is
+claimed in the database before its notification is written, so overlapping runs
+cannot queue the same alert twice.
 
 ## Batch and receipts
 

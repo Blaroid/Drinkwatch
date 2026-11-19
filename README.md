@@ -123,10 +123,10 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 | `DATABASE_URL` | postgres in compose | Postgres DSN |
 | `PUBLIC_BASE_URL` | http://127.0.0.1:8788 | links in API responses |
 | `ADMIN_TOKEN` | - | required for `/v1/admin/*` |
-| `SCRAPE_ENABLED` | true | master switch for scrapers |
+| `SCRAPE_ENABLED` | true | master switch for scrapers; does not stop alert or digest timers |
 | `SCRAPE_USER_AGENT` | DrinkWatch/0.1 | honest bot UA for seeding/geocoding |
 | `SCRAPE_BROWSER_UA` | Chrome 131 | Woolworths/Coles entry pages |
-| `SCHEDULER_ENABLED` | true | in-process APScheduler |
+| `SCHEDULER_ENABLED` | true | in-process APScheduler (scrape jobs follow `SCRAPE_ENABLED`) |
 | `PHOTOS_DIR` / `PHOTOS_HOST_DIR` | /srv/photos, ./photos | photo cache |
 | `OFF_LOOKUP_ENABLED` | true | Open Food Facts suggestion fallback |
 | `BARCODE_LOOKUP_LIMIT` | 8 | product-detail GTIN lookups per scraped chain per run |
