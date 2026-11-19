@@ -293,8 +293,20 @@ def submit_pending(
         if payload.photo_token:
             from ..models import Photo
 
-            photo = session.scalar(select(Photo).where(Photo.token == payload.photo_token))
-            photo_id = photo.id if photo else None
+            photo = session.scalar(
+                select(Photo).where(
+                    Photo.token == payload.photo_token,
+                    # Same rule as a plain sighting: the photo must be this
+                    # device's own upload and must still be servable, otherwise
+                    # the price is backed by someone else's picture or by one
+                    # whose bytes only exist on the backup disk.
+                    Photo.uploaded_by == device.id,
+                    Photo.pruned_at.is_(None),
+                )
+            )
+            if photo is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "unknown photo token")
+            photo_id = photo.id
         observation = Observation(
             store_id=store.id,
             chain_id=store.chain_id,

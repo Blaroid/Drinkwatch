@@ -267,6 +267,13 @@ from the same device returns the existing row (unless that row was pruned).
 A pruned row (local cache passed its 14 day retention) answers 410, never 404, so a
 client can tell "gone" apart from a URL it built wrongly.
 
+A sighting may name a `photo_token` (from this endpoint). It must be the upload
+device's own photo and it must not be pruned; anything else is rejected with
+`422 unknown photo token`. The observation response, `GET /v1/observations` and
+`GET /v1/me/observations` carry the attached `photo_token` and `photo_url` so the
+evidence can be shown; rows from before photo uploads carry only the legacy
+`photo_url` when the client supplied one.
+
 ## Plans
 
     POST /v1/basket/compare
@@ -364,7 +371,18 @@ cannot queue the same alert twice.
     POST /v1/receipts/parse           (device auth)
     {"text": "MONSTER ULTRA 4PK 17.50\nV ENERGY BLUE 250ML 3.29\nBANANAS 4.50"}
     200 [{"line": "MONSTER ULTRA 4PK 17.50", "price_cents": 1750,
-          "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 0.67}]
+          "product_slug": "monster-ultra-500ml-x4", "label": "Monster Ultra", "score": 1.0,
+          "alternatives": []},
+         {"line": "V ENERGY BLUE 250ML 3.29", "price_cents": 329,
+          "product_slug": "v-blue-250ml", "label": "V Blue", "score": 1.0,
+          "alternatives": []}]
+
+The size and pack count on the line (`250mL`, `4PK`, `x4`, `24 pack`) decide
+which row may match: a line that says `4PK` never scores the single can, and a
+line whose size or pack matches no row comes back with `product_slug: null`.
+When two rows still score the same, `product_slug` is the first and
+`alternatives` lists the rest so the user can choose instead of the database
+order choosing for them.
 
 A batch is charged against the hourly crowd write quota once, for its whole
 line count, rather than once per line: a receipt is one act of reporting. If
@@ -395,6 +413,8 @@ substring matches, and distance annotates (and sorts) when lat/lon are given.
     POST /v1/admin/products/{slug}/reject
     GET  /v1/admin/observations?status=needs_review&limit=100
     GET  /v1/admin/photos?limit=50
+         -> [{id, token, url, uploaded_by, bytes, created_at, pruned_at,
+              observation_id, product_id, store_id}]
     POST /v1/admin/alerts/evaluate           -> {"notifications_created": 1}
 
 `scripts/review.py` is the operator client for these: `queue` prints both review
