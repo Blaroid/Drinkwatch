@@ -12,6 +12,7 @@ from ..models import Product
 from ..pricing import (
     Bundle,
     KnapsackItem,
+    KnapsackResult,
     cheapest_quantity_plan,
     collect_offers,
     distance_travelled,
@@ -329,12 +330,18 @@ def max_caffeine(
                     )
         return pool
 
-    best = maximise_caffeine(items_for(), budget_cents)
     if mode == "single_store":
+        # The unrestricted pool is a superset of every per-store pool, so it can
+        # only tie or beat them; seeding from it would return a plan assembled
+        # from several shops under a one-shop label. Start empty and let each
+        # store fill the budget alone, keeping the nearest on a tie.
+        best = KnapsackResult()
         for store in stores:
             candidate = maximise_caffeine(items_for(store.id), budget_cents)
             if candidate.caffeine_mg > best.caffeine_mg:
                 best = candidate
+    else:
+        best = maximise_caffeine(items_for(), budget_cents)
 
     output_items: list[BudgetItemOut] = []
     total_ml = 0
