@@ -154,7 +154,8 @@ def client(
     session: Session, catalogue: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> TestClient:
     # The daily ledger upsert is Postgres-only and not what these tests cover.
-    monkeypatch.setattr(crowd_api, "record_daily_price", lambda *args, **kwargs: None)
+    # crowd.py now funnels every write through daily.sync_daily_price().
+    monkeypatch.setattr(crowd_api, "sync_daily_price", lambda *args, **kwargs: None)
     monkeypatch.setattr(crowd_api, "write_limiter", SimpleNamespace(check=lambda key: None))
     device = Device(token_hash="scanner")
     session.add(device)
