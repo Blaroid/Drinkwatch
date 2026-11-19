@@ -1,0 +1,84 @@
+<!-- Synthetic fixture: the tile markup shape SpudShed's energy-drinks category
+     pages use. Hand-built rather than captured from the live site, so the parser
+     tests run offline and never depend on a retailer's current HTML. -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Energy Drinks | Spudshed</title>
+  </head>
+  <body>
+    <main class="category-lines">
+      <div id="line_4821" class="talker talker--on-special" data-talker>
+        <a class="talker__link" href="/lines/monster-aussie-lemonade-500ml">
+          <div class="talker__name" title="Monster Aussie Lemonade 500mL">
+            <span class="talker__product-name">Monster Aussie Lemonade</span>
+            <span class="talker__name__size">500mL</span>
+          </div>
+        </a>
+        <div class="talker__prices">
+          <span class="talker__prices__was weak">was $4.49</span>
+          <strong class="price__sell">$3.29</strong>
+        </div>
+      </div>
+
+      <!-- No title attribute: the parser has to rebuild the name from the spans. -->
+      <div id="line_4822" class="talker" data-talker>
+        <a href="/lines/red-bull-energy-drink-250ml">
+          <div class="talker__name">
+            <span class="talker__product-name">Red Bull Energy Drink</span>
+            <span class="talker__name__size">250mL</span>
+          </div>
+        </a>
+        <div class="talker__prices">
+          <strong class="price__sell">$3.10</strong>
+        </div>
+      </div>
+
+      <!-- An empty title attribute is as good as a missing one. -->
+      <div id="line_4823" class="talker" data-talker>
+        <a href="/lines/v-energy-500ml">
+          <div class="talker__name" title="">
+            <span class="talker__product-name">V Energy</span>
+            <span class="talker__name__size">500mL</span>
+          </div>
+        </a>
+        <div class="talker__prices">
+          <strong class="price__sell">$3.50</strong>
+        </div>
+      </div>
+
+      <!-- A "was" price below the current price is stale markup, not a special. -->
+      <div id="line_4824" class="talker talker--on-special" data-talker>
+        <a href="/lines/mother-500ml">
+          <div class="talker__name" title="Mother 500mL">
+            <span class="talker__product-name">Mother</span>
+            <span class="talker__name__size">500mL</span>
+          </div>
+        </a>
+        <div class="talker__prices">
+          <span class="talker__prices__was weak">was $2.00</span>
+          <strong class="price__sell">$3.50</strong>
+        </div>
+      </div>
+
+      <!-- Tiles that must be skipped: no line id, no link, no sell price. -->
+      <div id="promo_9001" class="talker" data-talker>
+        <a href="/lines/rockstar-500ml"><div class="talker__name" title="Rockstar 500mL"></div></a>
+        <strong class="price__sell">$2.99</strong>
+      </div>
+
+      <div id="line_4825" class="talker" data-talker>
+        <div class="talker__name" title="NOS 500mL"></div>
+        <strong class="price__sell">$3.75</strong>
+      </div>
+
+      <div id="line_4826" class="talker" data-talker>
+        <a href="/lines/reign-storm-500ml">
+          <div class="talker__name" title="Reign Storm 500mL"></div>
+        </a>
+        <span class="talker__prices__was weak">save $1.00</span>
+      </div>
+    </main>
+  </body>
+</html>
