@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from sqlalchemy import and_, bindparam, func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -335,16 +336,76 @@ def compare(
     return out
 
 
+# The widget is polled on every phone unlock, so let the phone's HTTP cache
+# serve it and revalidate rather than cross the tunnel each time. Five minutes
+# is short enough that a price change still shows up while someone is shopping.
+_WIDGET_MAX_AGE_SECONDS = 300
+# Bump when the validator's inputs change, so a validator handed out by an older
+# build cannot be replayed against the new one.
+_WIDGET_ETAG_VERSION = "w1"
+
+
+def _freshest(current: datetime | None, candidate: datetime) -> datetime:
+    """Keep the newest observation timestamp seen while building the payload."""
+    if candidate.tzinfo is None:  # fixtures and backfills can hand us naive rows
+        candidate = candidate.replace(tzinfo=timezone.utc)
+    if current is None or candidate > current:
+        return candidate
+    return current
+
+
+def _widget_etag(query: str, freshest: datetime | None, items: list[WidgetItemOut]) -> str:
+    """Weak validator for /v1/widget, derived from the data rather than the bytes.
+
+    The payload cannot be hashed directly: generated_at and every item's
+    age_hours move on each request, so a digest of the response would never
+    match and the widget would never earn a 304. Hash what actually decides the
+    rows instead - the freshest observation behind them, plus every row field
+    except age_hours as a backstop for edits (a renamed product, a corrected
+    distance) that do not advance that timestamp. The query string keeps one
+    widget URL's validator from being replayed against another.
+    """
+    digest = hashlib.sha256()
+    digest.update(_WIDGET_ETAG_VERSION.encode())
+    digest.update(b"\x00")
+    digest.update(query.encode())
+    digest.update(b"\x00")
+    digest.update(freshest.isoformat().encode() if freshest is not None else b"-")
+    for item in items:
+        digest.update(b"\x00")
+        digest.update(item.model_dump_json(exclude={"age_hours"}).encode())
+    # Weak: the prices are unchanged, but age_hours in the body keeps drifting.
+    return f'W/"{digest.hexdigest()[:32]}"'
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 weak comparison of an If-None-Match list against our validator."""
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    target = etag.removeprefix("W/")
+    return any(
+        candidate.strip().removeprefix("W/") == target for candidate in if_none_match.split(",")
+    )
+
+
 @router.get("/widget", response_model=WidgetOut, summary="Smallest possible payload for a phone widget")
 def widget(
+    response: Response,
+    request: Request,
     lat: float = Query(ge=-90, le=90),
     lon: float = Query(ge=-180, le=180),
     products: str | None = Query(default=None, description="comma separated slugs (max 8)"),
     radius_km: float | None = Query(default=None, gt=0),
     max_age_hours: int | None = Query(default=None, ge=1, le=720),
     suggest: int = Query(default=0, ge=0, le=8, description="append this many similar drinks"),
+    if_none_match: str | None = Header(default=None),
     session: Session = Depends(get_session),
-) -> WidgetOut:
+) -> WidgetOut | Response:
+    # Part of the validator: the same prices at a different radius/location is a
+    # different widget, and a shared cache should not answer one with the other.
+    request_query = request.url.query
     radius = clamp_radius(radius_km)
     since = default_since(max_age_hours or settings.default_max_age_hours)
 
@@ -381,11 +442,13 @@ def widget(
 
     stores = nearby_stores(session, lat, lon, radius, limit=200)
     items: list[WidgetItemOut] = []
+    freshest: datetime | None = None
     for found in catalogue:
         offers = _offers_for_product(session, found, stores, since)
         if not offers:
             continue
         best = offers[0]
+        freshest = _freshest(freshest, best.observed_at)
         items.append(
             WidgetItemOut(
                 slug=found.slug,
@@ -430,6 +493,7 @@ def widget(
             ranked.append((same_brand, offers[0].price_cents, candidate, offers[0]))
         ranked.sort(key=lambda row: (row[0], row[1]))
         for _, _, candidate, best in ranked[:suggest]:
+            freshest = _freshest(freshest, best.observed_at)
             items.append(
                 WidgetItemOut(
                     slug=candidate.slug,
@@ -448,6 +512,14 @@ def widget(
                 )
             )
 
+    cache_headers = {
+        "Cache-Control": f"public, max-age={_WIDGET_MAX_AGE_SECONDS}",
+        "ETag": _widget_etag(request_query, freshest, items),
+    }
+    if _etag_matches(if_none_match, cache_headers["ETag"]):
+        # The client's copy is current; 304 keeps the tunnel bytes to headers only.
+        return Response(status_code=304, headers=cache_headers)
+    response.headers.update(cache_headers)
     return WidgetOut(generated_at=utcnow(), radius_km=radius, items=items)
 
 
