@@ -131,6 +131,15 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 | `MAX_BUDGET_CENTS` | 20000 | cap for the budget optimiser |
 | `DAILY_CAFFEINE_LIMIT_MG` | 400 | guideline used by the gauge |
 
+## Data resets
+
+The barcode index was purged on 2026-11-19 (the seeded codes were a mix of
+GTIN-14 retailer strings, internal codes and test rows). `barcodes`,
+`products.barcode`/`normalised_barcode` and `listings.barcode` were cleared;
+a dump of the old table is in `backups/barcodes-*.sql`. New codes arrive from
+crowd scans (`POST /v1/products/pending`) and from the next scrape of a chain
+that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
+
 ## Operations
 
 * **Migrations** - `docker compose exec -T api python scripts/migrate.py`. Applied
