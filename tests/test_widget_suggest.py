@@ -241,6 +241,7 @@ def test_suggest_attributes_chain_prices_and_prefers_a_store_row(
 
     online = body["items"][1]
     assert (online["slug"], online["price_cents"]) == ("woolies-online", 250)
+    assert online["price_scope"] == "chain"
     assert (online["store"], online["chain"], online["distance_km"]) == (
         "Woolworths Perth",
         "woolworths",
@@ -255,6 +256,41 @@ def test_suggest_attributes_chain_prices_and_prefers_a_store_row(
         260,
         "SpudShed Wangara",
     )
+    assert shelf["price_scope"] == "store"
+
+
+def test_suggestions_come_from_fresh_offers_not_the_first_60_alphabetically(
+    db: tuple[Engine, Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The old pool was order_by(brand, name).limit(60), so V could never appear.
+
+    Live evidence: a widget tracking V returned no V suggestion although 63
+    fresh V prices existed nearby - the alphabetical cut-off ended inside the
+    M's. The pool is now every verified drink with a fresh offer at a scanned
+    store, ranked by brand match then price.
+    """
+    _engine, session = db
+    _seed(session)
+    _product(session, 1, "monster-ultra", "Monster", "Ultra")
+    for index in range(70):
+        _product(session, 100 + index, f"aardvark-{index:02d}", "Aardvark", f"Flavour {index}")
+        _obs(session, 1000 + index, product_id=100 + index, store_id=1, price_cents=400 + index)
+    _product(session, 200, "v-blue-500ml", "V", "Blue")
+    _obs(session, 2000, product_id=200, store_id=1, price_cents=300)
+    # Neither a pending product nor one with no fresh offer is part of the pool.
+    pending = _product(session, 300, "monster-smoke-test-500ml", "Monster", "Smoke Test")
+    pending.status = "pending"
+    _obs(session, 3000, product_id=300, store_id=1, price_cents=100)
+    _product(session, 301, "mystery-nothing", "Mystery", "Nothing")
+    session.commit()
+
+    body = _widget(session, monkeypatch, suggest=8)
+
+    suggested = [item["slug"] for item in body["items"] if item["suggested"]]
+    assert suggested[0] == "v-blue-500ml"
+    assert len(suggested) == 8
+    assert "monster-smoke-test-500ml" not in suggested
+    assert "mystery-nothing" not in suggested
 
 
 def test_suggest_reads_the_alias_group_and_the_newest_row(

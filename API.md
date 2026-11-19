@@ -31,14 +31,17 @@ energy drinks. Optional `max_age_hours` (default 72).
           "distance_km": 0.0,
           "promo": "none",
           "source": "crowd",
+          "price_scope": "store",
           "age_hours": 0.0
         }
       ]
     }
 
 Payload is small on purpose (well under 2 KB for 8 items). `source` is `crowd`
-or `scrape`; show a "~" or "online" marker when the underlying price came from
-`/v1/prices` with `price_scope=chain`.
+or `scrape`; `price_scope` is `store` for a price seen on that shop's shelf and
+`chain` when it is the chain's own online price attributed to the shop. Mark a
+`chain` row (the old clients inferred it from `source`, which called every
+scraped SpudShed store price "online").
 
 ## Reads
 
@@ -51,6 +54,11 @@ or `scrape`; show a "~" or "online" marker when the underlying price came from
     GET /v1/prices?product={slug}&lat&lon&radius_km&max_age_hours=72&chain=
     GET /v1/compare?products=slug1,slug2&lat&lon&radius_km
     GET /v1/observations?product={slug}&store_id=&source=crowd&limit=50
+    GET /v1/observations?include_flagged=true   // also needs_review rows
+
+`/v1/products`, `/v1/catalogue`, `/v1/deals` and the widget's default and
+suggestion lists only contain `verified` products, so a crowd-submitted row
+waiting at `status=pending` cannot be picked before review.
 
 /v1/prices returns the product plus every nearby store that has a fresh price,
 cheapest first:
@@ -131,6 +139,11 @@ hour before it. Different devices reporting the same price are the same fact, so
 `"sightings": 5` rather than showing five identical rows; the write response
 carries the full tally too. Each report is still stored, so the count is the
 crowd agreeing with itself rather than a repeated click by one device.
+
+The feed only lists `status: "accepted"` rows, because a `needs_review` outlier
+is not a price any other endpoint will quote. Every row carries its `status`,
+and `include_flagged=true` also returns the quarantined rows so a client can
+badge them instead of hiding them.
 
 Confirm or dispute someone else's sighting:
 
@@ -243,7 +256,9 @@ Stores that cannot cover every item come back with `complete: false` and sort la
 
 `product_slug` and `label` name the pack the optimiser actually bought, so they
 always agree with `cost_cents` and `breakdown`: a plan of two singles is labelled
-as the single, never as the x4 pack. `/v1/plan/route` items carry the same fields.
+as the single, never as the x4 pack. `/v1/plan/route` items carry the same
+`BasketLineOut` fields (`units`, `price`, ...) and keep `cost` as a deprecated
+alias of `price` for builds that still read it.
 
     GET /v1/value/max-caffeine?budget_cents=2000&lat=-31.9523&lon=115.8613
         &radius_km=25&mode=single_store|multi_store&include_specials=true

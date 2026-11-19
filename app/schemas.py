@@ -99,6 +99,9 @@ class WidgetItemOut(BaseModel):
     distance_km: float | None = None
     promo: str
     source: str
+    # store = a shelf price, chain = one online price standing for the chain.
+    # Optional so a client built against the old payload still parses it.
+    price_scope: str | None = None
     age_hours: float
     suggested: bool = False
 
@@ -326,6 +329,18 @@ class MaxCaffeineOut(BaseModel):
     stores_used: int
 
 
+class RouteLineOut(BasketLineOut):
+    """One route stop's line: the basket-line shape plus the legacy ``cost`` key.
+
+    API.md has always promised route items carry the same fields as basket
+    lines, but they were hand-built dicts with ``cost`` and no ``units``/``price``,
+    so a client had to branch on which plan endpoint a line came from. ``cost``
+    is kept (same value as ``price``) for builds that still read it.
+    """
+
+    cost: str = Field(default="", description="deprecated alias of price")
+
+
 class RouteStopOut(BaseModel):
     store_id: int
     store_name: str
@@ -335,7 +350,7 @@ class RouteStopOut(BaseModel):
     lon: float | None = None
     subtotal_cents: int
     subtotal: str
-    items: list[dict] = []
+    items: list[RouteLineOut] = []
     distance_from_origin_km: float | None = None
 
 
