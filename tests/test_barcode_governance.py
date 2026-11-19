@@ -329,6 +329,10 @@ def test_admin_lists_barcode_bindings(
     assert [row["barcode"] for row in filtered.json()] == [OTHER_CODE]
     crowd = client.get("/v1/admin/barcodes", params={"source": "crowd"})
     assert [row["barcode"] for row in crowd.json()] == [BOUND_CODE]
+    # Any form of one physical code finds its rows: a moderator holding the
+    # 14-digit form still sees the EAN-13 binding.
+    by_form = client.get("/v1/admin/barcodes", params={"barcode": "0" + BOUND_CODE})
+    assert [row["barcode"] for row in by_form.json()] == [BOUND_CODE]
 
 
 def test_admin_delete_unbinds_every_form_of_the_code(
@@ -374,6 +378,25 @@ def test_admin_delete_leaves_a_form_bound_to_another_product(
     assert [row.product_id for row in _bindings(session, "0" + upc)] == [catalogue.ultra.id]
 
 
+def test_admin_delete_reports_a_product_column_claim(
+    client: TestClient, session: Session, catalogue: SimpleNamespace
+) -> None:
+    # A product that carries the code in its own columns resolves a scan even
+    # with no barcode row, so the moderator has to be told it survives the
+    # delete instead of being left to think the code is unbound.
+    upc = "641572321887"
+    catalogue.ultra.normalised_barcode = "0" + upc
+    session.add(Barcode(barcode=upc, product_id=catalogue.green.id, source="crowd"))
+    session.flush()
+
+    body = client.delete(f"/v1/admin/barcodes/{upc}").json()
+
+    assert body["removed"] == [upc]
+    assert body["other_products"] == {"0" + upc: catalogue.ultra.id}
+    session.refresh(catalogue.ultra)
+    assert catalogue.ultra.normalised_barcode == "0" + upc
+
+
 def test_admin_map_moves_a_binding_to_the_right_product(
     client: TestClient, session: Session, catalogue: SimpleNamespace
 ) -> None:
@@ -413,6 +436,30 @@ def test_admin_map_binds_a_code_the_crowd_flow_refused(
     assert {row.barcode for row in rows} == {PUBLISHED_INVALID, "0" + PUBLISHED_INVALID}
     assert {row.source for row in rows} == {"admin"}
     assert client.get(f"/v1/barcode/{PUBLISHED_INVALID}").json()["found"] is True
+
+
+def test_admin_map_takes_the_code_from_the_old_product_columns(
+    client: TestClient, session: Session, catalogue: SimpleNamespace
+) -> None:
+    # The old product can hold the code in normalised_barcode with no barcode row
+    # at all (backfill indexes the primary column only). Moving the index row
+    # alone would leave the scan resolving to the old product through the column.
+    upc = "641572321887"
+    catalogue.ultra.normalised_barcode = "0" + upc
+    session.add(Barcode(barcode=upc, product_id=catalogue.ultra.id, source="crowd"))
+    session.flush()
+
+    response = client.post(
+        f"/v1/admin/barcodes/{upc}/map",
+        json={"product_slug": "mother-green-500ml"},
+    )
+
+    assert response.status_code == 200, response.text
+    session.refresh(catalogue.ultra)
+    assert catalogue.ultra.normalised_barcode is None
+    assert catalogue.ultra.barcode is None
+    assert client.get(f"/v1/barcode/{upc}").json()["product"]["id"] == catalogue.green.id
+    assert client.get(f"/v1/barcode/0{upc}").json()["product"]["id"] == catalogue.green.id
 
 
 def test_admin_barcode_routes_404_on_unknown_codes_and_products(
@@ -534,6 +581,41 @@ def test_a_negative_that_aged_out_is_looked_up_again(
     assert row.payload["found"] is True
 
 
+def test_a_positive_answer_that_aged_out_is_looked_up_again(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # OFF_TTL bounds every cached answer, not just a negative: a label figure or
+    # a name can change upstream, and a scan must eventually see the new one.
+    calls = _off(
+        monkeypatch, (200, {"product": {"product_name": "Renamed", "brands": "Mother"}})
+    )
+    _cached_payload(
+        session,
+        CREATED_CODE,
+        {"source": "openfoodfacts", "found": True, "name": "Old Name"},
+        age=barcode_api.OFF_TTL + timedelta(days=1),
+    )
+
+    suggestion = client.get(f"/v1/barcode/{CREATED_CODE}").json()["suggestion"]
+
+    assert suggestion["name"] == "Renamed"
+    assert len(calls) == 1
+
+
+def test_a_negative_answer_from_open_food_facts_is_cached_but_not_served(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 200 with no product is a real answer, so it is worth caching; it is still
+    # not a suggestion, and the second scan reads the cache instead of the network.
+    calls = _off(monkeypatch, (200, {"product": {}}))
+
+    assert client.get(f"/v1/barcode/{CREATED_CODE}").json()["suggestion"] is None
+    row = session.scalar(select(BarcodeCache).where(BarcodeCache.barcode == CREATED_CODE))
+    assert row is not None and row.payload["found"] is False
+    assert client.get(f"/v1/barcode/{CREATED_CODE}").json()["suggestion"] is None
+    assert len(calls) == 1
+
+
 def test_a_failed_lookup_is_not_cached_as_a_negative(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -559,6 +641,21 @@ def test_the_barcode_read_is_rate_limited(
     assert client.get(f"/v1/barcode/{NEW_CODE}").status_code == 200
 
     assert read_limiter.keys == ["barcode:testclient"]
+
+
+def test_the_rate_limit_key_is_the_hop_our_proxy_appended(
+    client: TestClient,
+    catalogue: SimpleNamespace,
+    read_limiter: _RecordingLimiter,
+) -> None:
+    # A scanner can send any X-Forwarded-For prefix it likes; only the address
+    # our own proxy appended is real, so a forged prefix must not mint a new key.
+    first = {"x-forwarded-for": "1.2.3.4, 203.0.113.9"}
+    second = {"x-forwarded-for": "5.6.7.8, 203.0.113.9"}
+    assert client.get(f"/v1/barcode/{NEW_CODE}", headers=first).status_code == 200
+    assert client.get(f"/v1/barcode/{NEW_CODE}", headers=second).status_code == 200
+
+    assert read_limiter.keys == ["barcode:203.0.113.9", "barcode:203.0.113.9"]
 
 
 def test_the_barcode_read_returns_429_when_the_limiter_refuses(

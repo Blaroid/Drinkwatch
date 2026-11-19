@@ -58,10 +58,18 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
 
 
 def client_ip(request: Request) -> str:
-    """The caller's address, honouring the proxy header the containers sit behind."""
+    """The caller's address, for keying a rate limit.
+
+    Only the last X-Forwarded-For hop is trustworthy: our own proxy appends the
+    address it saw, while every earlier entry is whatever the caller chose to
+    send. Reading the first entry would let one scanner mint a new limiter key
+    per request by forging a prefix.
+    """
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        if hops:
+            return hops[-1]
     return request.client.host if request.client else "unknown"
 
 

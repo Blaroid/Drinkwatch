@@ -174,7 +174,10 @@ price adds it to the deal history and rejecting one takes it back out.
 The barcode index is written by the crowd, so it needs the same moderation: map a
 code that landed on the wrong can, or delete a binding that should not exist.
 Both act on every form of the code (EAN-13, its GTIN-14, UPC-A) and on the
-product's own barcode column, because either one alone resolves a scan.
+product's own barcode column, because either one alone resolves a scan. A re-map
+takes the code away from every other product that still carries it; a delete
+reports one that keeps resolving it, under `other_products`, rather than claiming
+the code is unbound.
 
 ## Errors
 

@@ -232,20 +232,42 @@ def _release_product_code(product: Product | None, forms: list[str]) -> list[str
     return released
 
 
+def _other_claimants(session: Session, product_id: int, forms: list[str]) -> list[Product]:
+    """Products whose own barcode columns resolve one of ``forms``.
+
+    Both products.barcode and products.normalised_barcode win a scan without the
+    barcodes table, so a moderator acting on a code has to account for them too.
+    """
+    return list(
+        session.scalars(
+            select(Product).where(
+                Product.id != product_id,
+                (Product.barcode.in_(forms)) | (Product.normalised_barcode.in_(forms)),
+            )
+        )
+    )
+
+
 def _claim_product_code(session: Session, product: Product, raw: str) -> bool:
-    """Make a mapped code the product's own code when no other row claims it."""
+    """Make a mapped code the product's own code when nobody else claims it.
+
+    Writing the columns while another product still resolves the same code would
+    leave a scan with two answers, so the index rows alone carry the mapping
+    until the conflict is resolved.
+    """
     from ..scrape.normalize import normalize_barcode
 
+    forms = _code_forms(raw)
+    if _other_claimants(session, product.id, forms):
+        return False
     changed = False
     normalised = normalize_barcode(raw)
     if normalised and not product.normalised_barcode:
         product.normalised_barcode = normalised
         changed = True
     if not product.barcode:
-        holder = session.scalar(select(Product.id).where(Product.barcode.in_(_code_forms(raw))))
-        if holder is None:
-            product.barcode = raw
-            changed = True
+        product.barcode = raw
+        changed = True
     return changed
 
 
@@ -306,6 +328,14 @@ def delete_barcode(barcode: str, session: Session = Depends(get_session)) -> dic
     removed = [row.barcode for row in rows if row.product_id == target]
     product = session.get(Product, target)
     released = _release_product_code(product, forms)
+    others = {row.barcode: row.product_id for row in rows if row.product_id != target}
+    # A product that carries the code in its own columns keeps resolving a scan
+    # after the index row is gone, so report it rather than leaving the moderator
+    # believing the binding is dead.
+    for holder in _other_claimants(session, target, forms):
+        for form in (holder.barcode, holder.normalised_barcode):
+            if form in forms:
+                others.setdefault(form, holder.id)
     for row in rows:
         if row.product_id == target:
             session.delete(row)
@@ -315,9 +345,7 @@ def delete_barcode(barcode: str, session: Session = Depends(get_session)) -> dic
         "removed": removed,
         "product_slug": product.slug if product is not None else None,
         "product_columns_cleared": released,
-        "other_products": {
-            row.barcode: row.product_id for row in rows if row.product_id != target
-        },
+        "other_products": others,
     }
 
 
@@ -333,15 +361,24 @@ def map_barcode(
     product = session.scalar(select(Product).where(Product.slug == payload.product_slug))
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown product")
+    forms = _code_forms(barcode)
+    # A scan resolves through the index rows and through products.barcode /
+    # normalised_barcode alike, so a move has to take the code away from every
+    # product that currently answers it - including one that only carries it in
+    # its own columns, which no barcode row would have revealed.
+    holders = set(session.scalars(select(Barcode.product_id).where(Barcode.barcode.in_(forms))))
+    holders |= {holder.id for holder in _other_claimants(session, product.id, forms)}
+    holders.discard(product.id)
+    for holder_id in sorted(holders):
+        _release_product_code(session.get(Product, holder_id), forms)
     created: list[str] = []
     moved: list[str] = []
-    for form in _code_forms(barcode):
+    for form in forms:
         row = session.get(Barcode, form)
         if row is None:
             session.add(Barcode(barcode=form, product_id=product.id, source="admin"))
             created.append(form)
         elif row.product_id != product.id:
-            _release_product_code(session.get(Product, row.product_id), [form])
             row.product_id = product.id
             moved.append(form)
     columns = _claim_product_code(session, product, barcode)
