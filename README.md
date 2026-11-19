@@ -23,7 +23,7 @@ scrapers, the price ledger, the crowd API and the plans (basket, budget, route).
   *what is the best use of $20 if I only care about caffeine*, *is the drive worth
   it once fuel is counted*.
 
-## Data sources, honestly
+## Data sources
 
 | Source | Prices | How |
 |---|---|---|
