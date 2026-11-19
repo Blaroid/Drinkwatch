@@ -44,6 +44,12 @@ from .deps import (
 
 router = APIRouter(prefix="/v1", tags=["public"])
 
+# How many stores to *scan* for a price query. The public `limit` caps the offers
+# returned; it must not cap the scan, or a chain whose stores happen to be further
+# down the distance list disappears from the answer (around the CBD, Woolworths
+# filled the first 50 stores and SpudShed's $8.75 was silently dropped).
+STORE_SCAN_LIMIT = 400
+
 _DEAL_STATS_SQL = text(
     """
     select chain_id,
@@ -490,12 +496,12 @@ def prices(
     found = get_product_by_slug(session, product)
     radius = clamp_radius(radius_km)
     since = default_since(max_age_hours or settings.default_max_age_hours)
-    stores = nearby_stores(session, lat, lon, radius, chain, limit=limit)
+    stores = nearby_stores(session, lat, lon, radius, chain, limit=STORE_SCAN_LIMIT)
     offers = _offers_for_product(session, found, stores, since)
     return ProductPricesOut(
         product=ProductOut.model_validate(found),
         cheapest=offers[0] if offers else None,
-        offers=offers,
+        offers=offers[:limit],
     )
 
 
@@ -512,7 +518,7 @@ def compare(
     slugs = [s.strip() for s in products.split(",") if s.strip()][:12]
     radius = clamp_radius(radius_km)
     since = default_since(max_age_hours or settings.default_max_age_hours)
-    stores = nearby_stores(session, lat, lon, radius, chain, limit=200)
+    stores = nearby_stores(session, lat, lon, radius, chain, limit=STORE_SCAN_LIMIT)
     out: list[ProductPricesOut] = []
     for slug in slugs:
         found = get_product_by_slug(session, slug)
