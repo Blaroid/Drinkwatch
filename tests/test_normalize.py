@@ -37,6 +37,10 @@ from app.scrape.normalize import barcode_variants, normalize_barcode, parse_pack
         # comes from the count-sized pair, not from the total.
         ("Red Bull Energy Drink 12x250ml 3L", (250, 12)),
         ("V Energy Blue 4x250ml 1L", (250, 4)),
+        # The total can be the size written next to the count instead: dividing
+        # it by the count recovers the can rather than inventing a 6 L one.
+        ("6000ML V Energy 24 Pack", (250, 24)),
+        ("V Energy 6000ML x 24", (250, 24)),
     ],
 )
 def test_parse_pack(text: str | None, expected: tuple[int | None, int]) -> None:
@@ -61,6 +65,8 @@ def test_parse_pack_derives_the_pack_count_from_a_carton_total() -> None:
     # can size (the phantom "v-blue-6000ml" product).
     assert parse_pack("6000ML V Energy Drink Blue 250mL") == (250, 24)
     assert parse_pack("1L V Energy Blue 4x250ml") == (250, 4)
+    # The count can be written straight after the total: 6000 / 24 = 250mL.
+    assert parse_pack("6000ML V Energy 24 Pack") == (250, 24)
 
 
 def test_parse_pack_will_not_invent_a_six_litre_can() -> None:
@@ -68,6 +74,8 @@ def test_parse_pack_will_not_invent_a_six_litre_can() -> None:
     # with nothing to divide by; the size stays unknown rather than invented.
     assert parse_pack("6000ML") == (None, 1)
     assert parse_pack("3L") == (None, 1)
+    # The same total without a count to divide by is still not a can.
+    assert parse_pack("6000ML V Energy") == (None, 1)
 
 
 @pytest.mark.parametrize(

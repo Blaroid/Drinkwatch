@@ -111,26 +111,59 @@ def parse_pack(text: str | None) -> tuple[int | None, int]:
     # "4 x 500mL": count first, size attached to the unit.
     count_first = PACK_X_RE.search(text)
     if count_first:
-        size_ml = _to_ml(float(count_first.group(2)), count_first.group(3))
-        return size_ml, max(1, int(count_first.group(1)))
+        pair = _stated_pack(
+            _to_ml(float(count_first.group(2)), count_first.group(3)),
+            int(count_first.group(1)),
+        )
+        if pair is not None:
+            return pair
 
     # "500mL x 12" / "500mL x 4 pack": size first, count after it.
     size_first = SIZE_X_COUNT_RE.search(text)
     if size_first:
-        size_ml = _to_ml(float(size_first.group(1)), size_first.group(2))
-        return size_ml, max(1, int(size_first.group(3)))
+        pair = _stated_pack(
+            _to_ml(float(size_first.group(1)), size_first.group(2)),
+            int(size_first.group(3)),
+        )
+        if pair is not None:
+            return pair
 
     # "250mL 24 Pack": the count the title ties to the size is the carton.
     attached = SIZE_ATTACHED_PACK_RE.search(text)
     if attached:
-        size_ml = _to_ml(float(attached.group(1)), attached.group(2))
-        return size_ml, max(1, int(attached.group(3)))
+        pair = _stated_pack(
+            _to_ml(float(attached.group(1)), attached.group(2)),
+            int(attached.group(3)),
+        )
+        if pair is not None:
+            return pair
 
     sizes = _size_tokens(text)
     derived = _pack_from_total(sizes)
     if derived is not None:
         return derived
     return _can_size(sizes), max(1, _declared_pack(text) or 1)
+
+
+def _stated_pack(size_ml: int | None, pack_count: int) -> tuple[int, int] | None:
+    """(can size, pack count) for one size/count pair in the text, or None.
+
+    A pair can state the carton's total volume instead of a can - PackageSize
+    "6000ML" next to a "24 Pack" title - and reading that as the unit is exactly
+    how the phantom 6 L can was made. Dividing the total by the count recovers
+    the can, and an indivisible total is left for the rules that do not treat it
+    as a container.
+    """
+    if size_ml is None:
+        return None
+    pack_count = max(1, pack_count)
+    if size_ml <= MAX_SINGLE_ML:
+        return size_ml, pack_count
+    if pack_count > 1 and size_ml % pack_count == 0:
+        can_ml = size_ml // pack_count
+        if can_ml <= MAX_SINGLE_ML:
+            return can_ml, pack_count
+    return None
 
 
 def _size_tokens(text: str) -> list[int]:

@@ -11,8 +11,9 @@ The parser is fixed in app/scrape/normalize.py; this repairs the rows it already
 wrote. Each listing is re-read from its stored title and size text, moved to the
 product that pack describes (created or matched by ``match_product()``, so the
 slug follows the same convention as a fresh scrape), and its observations are
-repriced for the new pack. Price history (price_daily) moves with them through
-the ledger writers in app/daily.py rather than by copying rows.
+repriced for the new pack. Price history (price_daily) follows through the
+ledger writers in app/daily.py; a day row that outlived its sighting is
+repointed with them rather than copied.
 
 A product row shared with other listings is left alone and reported: its pack is
 whatever those listings were sold in, so this script has no business rewriting
@@ -29,7 +30,7 @@ import argparse
 import sys
 from dataclasses import dataclass
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, ".")
@@ -116,12 +117,46 @@ def _is_empty(session: Session, product: Product) -> bool:
     return True
 
 
-def _ledger_rows(session: Session, product_id: int) -> int:
-    return session.scalar(
-        select(func.count())
-        .select_from(PriceDaily)
-        .where(PriceDaily.product_id == product_id)
-    ) or 0
+def _move_ledger(session: Session, old_id: int, target_id: int) -> int:
+    """Repoint ledger days no observation carried over; returns rows that left old.
+
+    A ``price_daily`` row can outlive its observation (a day written by an
+    earlier scrape or rebuild), and a retired product's history is hidden from
+    every read path with it. A day the target already has is dropped instead, as
+    scripts/merge_duplicates.py does: the target's row is the price its slug is
+    already serving.
+    """
+    keys = (PriceDaily.day, PriceDaily.chain_id, PriceDaily.store_id)
+    taken = {
+        tuple(row)
+        for row in session.execute(select(*keys).where(PriceDaily.product_id == target_id))
+    }
+    moved = 0
+    for row in session.execute(select(*keys).where(PriceDaily.product_id == old_id)).all():
+        key = tuple(row)
+        matched = (
+            PriceDaily.day == row.day,
+            PriceDaily.chain_id == row.chain_id,
+            PriceDaily.product_id == old_id,
+            # store_id is nullable, so "the same store" needs is_(None), not ==.
+            PriceDaily.store_id.is_(None)
+            if row.store_id is None
+            else PriceDaily.store_id == row.store_id,
+        )
+        if key in taken:
+            session.execute(
+                delete(PriceDaily).where(*matched).execution_options(synchronize_session=False)
+            )
+        else:
+            session.execute(
+                update(PriceDaily)
+                .where(*matched)
+                .values(product_id=target_id)
+                .execution_options(synchronize_session=False)
+            )
+            taken.add(key)
+        moved += 1
+    return moved
 
 
 def _move_references(
@@ -129,7 +164,6 @@ def _move_references(
 ) -> dict[str, int]:
     """Point every reference that described the bad pack at the corrected row."""
     moved = {"observations": 0, "price_daily": 0, "alerts": 0, "barcodes": 0}
-    ledger_before = _ledger_rows(session, old.id)
 
     # Oldest first so the newest sighting ends up as the target's day row, the
     # way record_daily_price() resolves same-day writes.
@@ -138,24 +172,28 @@ def _move_references(
         .where(Observation.product_id == old.id)
         .order_by(Observation.observed_at, Observation.id)
     ):
-        # The ledger writers decide a day from the observation's status, and an
-        # accepted observation is its own "still accepted" replacement - so the
-        # price is withdrawn under a temporary status that is restored before
-        # the session can commit, then re-recorded against the new product.
+        # Only an accepted sighting has a ledger row, and the writers resolve a
+        # day from the observation's status: an accepted observation is its own
+        # "still accepted" replacement, so it is withdrawn under a temporary
+        # status that is restored before the session can commit. A pending
+        # sighting wrote nothing, and withdrawing it after its product_id moved
+        # could delete a row the target owns for that day.
         status = observation.status
-        observation.status = "rejected"
-        session.flush()
-        withdraw_daily_price(session, observation)
+        accepted = status == "accepted"
+        if accepted:
+            observation.status = "rejected"
+            session.flush()
+            withdraw_daily_price(session, observation)
         observation.product_id = target.id
         observation.unit_price_cents_per_l = per_litre_cents(
             observation.price_cents, fix.size_ml, fix.pack_count
         )
-        observation.status = status
-        sync_daily_price(session, observation)
+        if accepted:
+            observation.status = status
+            sync_daily_price(session, observation)
         moved["observations"] += 1
-    # Rows the writers could not re-record land in the target's ledger instead,
-    # so what left the old product is what the repair actually rewrote.
-    moved["price_daily"] = max(0, ledger_before - _ledger_rows(session, old.id))
+    # Days the observations did not carry over still describe the same SKU.
+    moved["price_daily"] = _move_ledger(session, old.id, target.id)
 
     moved["alerts"] = session.execute(
         update(PriceAlert).where(PriceAlert.product_id == old.id).values(product_id=target.id)
