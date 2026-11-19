@@ -11,10 +11,14 @@ from sqlalchemy.orm import Session
 from ..models import Product
 
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L|litres?|liters?)\b")
-PACK_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b")
+PACK_X_RE = re.compile(
+    r"\b(\d{1,2})\s*[x×]\s*(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\b", re.IGNORECASE
+)
 # "500mL x 12": the size first and the count after it, which the chains use for
 # cartons as often as the "12 x 500mL" spelling PACK_X_RE reads.
-SIZE_X_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\s*[x×]\s*(\d{1,2})\b")
+SIZE_X_COUNT_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ml|mL|ML|l|L)\s*[x×]\s*(\d{1,2})\b", re.IGNORECASE
+)
 PACK_WORD_RE = re.compile(r"\b(\d{1,2})\s*(?:pack|pk|p)\b", re.IGNORECASE)
 # "(24x Pack)" / "24x carton": count before an "x", no per-unit size.
 PACK_COUNT_X_RE = re.compile(r"\b(\d{1,2})\s*[x×]\s*(?:pack|pk|carton|box)\b", re.IGNORECASE)

@@ -278,8 +278,11 @@ def _photo(
 
 
 def _pending_payload(store_id: int, token: str) -> dict:
+    # A valid check digit: this flow refuses a code that could otherwise become
+    # a permanent binding, so a fixture with a bad digit fails before the photo
+    # checks these tests are about.
     return {
-        "barcode": "9300633099999",
+        "barcode": "9300633099992",
         "name": "Photo Test 500mL",
         "brand": "Monster",
         "size_ml": 500,
