@@ -362,6 +362,7 @@ class AlertIn(BaseModel):
     # always send max_price_cents behave exactly as before.
     max_price_cents: int | None = Field(default=None, gt=0, le=50000)
     min_drop_percent: int | None = Field(default=None, ge=1, le=90)
+    on_special: bool = False
     chain_code: str | None = Field(default=None, max_length=32)
     store_id: int | None = None
     # Location filter for "alert me about shops near me"; all three or none.
@@ -467,3 +468,69 @@ class MetaOut(BaseModel):
     observation_count: int
     freshest_observation_at: datetime | None = None
     currency: str = "AUD"
+
+
+class HistoryPoint(BaseModel):
+    day: str
+    price_cents: int
+    store_name: str | None = None
+
+
+class HistoryOut(BaseModel):
+    product: ProductOut
+    days: int
+    points: list[HistoryPoint]
+    median_cents: int | None = None
+    min_cents: int | None = None
+    max_cents: int | None = None
+    stores_seen: int = 0
+
+
+class DealOut(BaseModel):
+    product: ProductOut
+    store_id: int
+    store_name: str
+    chain_code: str
+    suburb: str | None = None
+    distance_km: float | None = None
+    price_cents: int
+    price: str
+    per_can_cents: int | None = None
+    per_litre_cents: int | None = None
+    promo_kind: str
+    age_hours: float
+
+
+class CatalogueProduct(BaseModel):
+    slug: str
+    brand: str
+    name: str
+    size_ml: int | None = None
+    pack_count: int = 1
+    barcode: str | None = None
+
+
+class CatalogueOut(BaseModel):
+    generated_at: datetime
+    products: list[CatalogueProduct]
+    barcodes: dict[str, str]
+
+
+class ConfirmIn(BaseModel):
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+
+
+class WatchlistIn(BaseModel):
+    slugs: list[str] = Field(default_factory=list, max_length=40)
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    radius_km: int = Field(default=15, ge=1, le=100)
+
+
+class WatchlistOut(BaseModel):
+    slugs: list[str]
+    lat: float | None = None
+    lon: float | None = None
+    radius_km: int
+    updated_at: datetime | None = None

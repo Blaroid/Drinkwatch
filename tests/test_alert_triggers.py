@@ -165,3 +165,29 @@ def test_median_window_is_thirty_local_days_excluding_today() -> None:
     # follow the local date the price_daily rows were written under.
     now = datetime(2026, 1, 1, 17, 30, tzinfo=timezone.utc)
     assert _median_window(now) == (date(2025, 12, 3), date(2026, 1, 2))
+
+
+def test_ceiling_trigger_still_works() -> None:
+    matched, _ = _matches(_alert(max_price_cents=400), 350, None)
+    assert matched is True
+
+
+def test_special_trigger_fires_on_a_promotion_only() -> None:
+    assert _matches(_alert(on_special=True), 500, None, promo_kind="special")[0] is True
+    assert _matches(_alert(on_special=True), 500, None, promo_kind="multibuy")[0] is True
+    assert _matches(_alert(on_special=True), 500, None, promo_kind="none")[0] is False
+
+
+def test_drop_trigger_measures_against_the_median() -> None:
+    alert = _alert(min_drop_percent=20)
+    assert _matches(alert, 350, 500.0)[0] is True
+    assert _matches(alert, 420, 500.0)[0] is False
+    assert _drop_percent(350, 500.0) == 30.0
+
+
+def test_triggers_compose() -> None:
+    alert = _alert(max_price_cents=300, min_drop_percent=10, on_special=True)
+    assert _matches(alert, 295, None)[0] is True  # ceiling
+    assert _matches(alert, 450, 500.0, promo_kind="special")[0] is True  # special
+    # 450 against a 400 median is no drop at all, so only the special trigger could fire.
+    assert _matches(alert, 450, 400.0, promo_kind="none")[0] is False

@@ -21,7 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -326,6 +326,8 @@ class PriceAlert(Base):
     lat: Mapped[float | None] = mapped_column(Float)
     lon: Mapped[float | None] = mapped_column(Float)
     radius_km: Mapped[float | None] = mapped_column(Float)
+    # "Tell me when a special starts": fires on promo_kind, not on a threshold.
+    on_special: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -403,3 +405,20 @@ class PriceDaily(Base):
     source: Mapped[str] = mapped_column(String(10), default="scrape")
 
     __mapper_args__ = {"primary_key": [day, chain_id, product_id]}
+
+
+class Watchlist(Base):
+    """A device's followed drinks plus where it usually shops (weekly digest)."""
+
+    __tablename__ = "watchlist"
+
+    device_id: Mapped[int] = mapped_column(
+        ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    slugs: Mapped[list[str]] = mapped_column(ARRAY(String(160)), default=list)
+    lat: Mapped[float | None] = mapped_column(Float)
+    lon: Mapped[float | None] = mapped_column(Float)
+    radius_km: Mapped[int] = mapped_column(Integer, default=15)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

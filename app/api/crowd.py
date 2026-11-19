@@ -27,6 +27,9 @@ from ..schemas import (
     ReceiptParseIn,
     ReportIn,
     VoteIn,
+    ConfirmIn,
+    WatchlistIn,
+    WatchlistOut,
 )
 from ..security import current_device, hash_token, new_device_token, read_limiter, write_limiter
 from .deps import find_product_by_barcode, format_cents, utcnow
@@ -606,3 +609,143 @@ def parse_receipt(
             )
         )
     return candidates
+
+
+# How close a device has to be for "I am standing here" to count. A supermarket
+# car park is within this; the next suburb is not.
+CONFIRM_RADIUS_KM = 0.5
+CONFIRM_REPEAT_WINDOW = timedelta(hours=6)
+
+
+@router.post(
+    "/observations/{observation_id}/confirm",
+    response_model=ObservationOut,
+    summary="\"This price is still right\" from the shop floor",
+)
+def confirm_observation(
+    observation_id: int,
+    payload: ConfirmIn,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> ObservationOut:
+    """Re-assert an existing price, refreshing its timestamp.
+
+    A confirmation is a new sighting, not a vote: the point is that the price is
+    still true *now*, which is what the freshness rule in the read path keys on.
+    If coordinates are supplied the device must be within half a kilometre of the
+    store, so the crowd signal cannot be farmed from the couch.
+    """
+    device = current_device(authorization, session=session)
+    write_limiter.check(f"confirm:{device.id}")
+
+    original = session.get(Observation, observation_id)
+    if original is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown observation")
+    if original.store_id is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "that is a chain-wide online price; confirm a store sighting instead",
+        )
+    store = session.get(Store, original.store_id)
+    if store is None or not store.is_active:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown store")
+
+    if payload.lat is not None and payload.lon is not None and store.lat is not None and store.lon is not None:
+        distance = haversine_km(payload.lat, payload.lon, store.lat, store.lon)
+        if distance > CONFIRM_RADIUS_KM:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"you are {distance:.1f} km from {store.name}; confirm from the shop",
+            )
+
+    now = utcnow()
+    repeat = session.scalar(
+        select(Observation)
+        .where(
+            Observation.device_id == device.id,
+            Observation.store_id == store.id,
+            Observation.product_id == original.product_id,
+            Observation.price_cents == original.price_cents,
+            Observation.observed_at >= now - CONFIRM_REPEAT_WINDOW,
+        )
+        .order_by(Observation.observed_at.desc())
+        .limit(1)
+    )
+    if repeat is not None:
+        return _serialize_one(session, repeat)
+
+    confirmed = Observation(
+        store_id=store.id,
+        chain_id=store.chain_id,
+        product_id=original.product_id,
+        price_cents=original.price_cents,
+        was_price_cents=original.was_price_cents,
+        promo_kind=original.promo_kind,
+        promo_qty=original.promo_qty,
+        promo_total_cents=original.promo_total_cents,
+        in_stock=original.in_stock,
+        source="crowd",
+        price_scope="store",
+        device_id=device.id,
+        note="confirmed on site",
+        observed_at=now,
+        status="accepted",
+    )
+    session.add(confirmed)
+
+    if original.device_id is not None and original.device_id != device.id:
+        existing = session.get(ObservationVote, (original.id, device.id))
+        if existing is None:
+            session.add(
+                ObservationVote(observation_id=original.id, device_id=device.id, vote=1)
+            )
+    device.reputation = (device.reputation or 0) + 1
+    session.commit()
+    return _serialize_one(session, confirmed)
+
+
+@router.get("/watchlist", response_model=WatchlistOut, summary="Followed drinks for the weekly digest")
+def get_watchlist(
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> WatchlistOut:
+    device = current_device(authorization, session=session)
+    row = session.get(Watchlist, device.id)
+    if row is None:
+        return WatchlistOut(slugs=[], radius_km=15)
+    return WatchlistOut(
+        slugs=list(row.slugs or []),
+        lat=row.lat,
+        lon=row.lon,
+        radius_km=row.radius_km,
+        updated_at=row.updated_at,
+    )
+
+
+@router.post("/watchlist", response_model=WatchlistOut, summary="Sync followed drinks")
+def put_watchlist(
+    payload: WatchlistIn,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> WatchlistOut:
+    device = current_device(authorization, session=session)
+    known = set(
+        session.scalars(select(Product.slug).where(Product.slug.in_(payload.slugs)))
+    ) if payload.slugs else set()
+    row = session.get(Watchlist, device.id)
+    if row is None:
+        row = Watchlist(device_id=device.id)
+        session.add(row)
+    # Only slugs that exist: a renamed product must not poison the digest.
+    row.slugs = [slug for slug in payload.slugs if slug in known][:40]
+    row.lat = payload.lat
+    row.lon = payload.lon
+    row.radius_km = payload.radius_km
+    session.commit()
+    return WatchlistOut(
+        slugs=list(row.slugs),
+        lat=row.lat,
+        lon=row.lon,
+        radius_km=row.radius_km,
+        updated_at=row.updated_at,
+    )

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 from sqlalchemy import and_, bindparam, case, func, or_, select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.expression import ColumnElement
@@ -17,7 +18,12 @@ from ..config import settings
 from ..db import get_session
 from ..models import Chain, Observation, Product, Store
 from ..schemas import (
+    CatalogueOut,
+    CatalogueProduct,
     ChainOut,
+    DealOut,
+    HistoryOut,
+    HistoryPoint,
     DealStatsOut,
     LeaderboardEntry,
     MetaOut,
@@ -31,6 +37,7 @@ from ..schemas import (
 from .crowd import fold_crowd_sightings
 from .deps import (
     age_hours,
+    bulk_latest_prices,
     bounding_box,
     clamp_radius,
     default_since,
@@ -479,6 +486,210 @@ def products(
     return [ProductOut.model_validate(p) for p in session.scalars(stmt)]
 
 
+_HISTORY_SQL = text(
+    """
+    select pd.day,
+           min(pd.price_cents) as price_cents,
+           (array_agg(s.name order by pd.price_cents))[1] as store_name,
+           count(distinct pd.store_id) as stores
+      from price_daily pd
+      join stores s on s.id = pd.store_id
+     where pd.product_id = :product_id
+       and pd.store_id is not null
+       and pd.day >= current_date - :days
+       and s.lat between :lat_min and :lat_max
+       and s.lon between :lon_min and :lon_max
+     group by pd.day
+     order by pd.day
+    """
+)
+
+
+@router.get("/history", response_model=HistoryOut, summary="Daily price history for one drink")
+def history(
+    product: str = Query(description="product slug"),
+    lat: float = Query(ge=-90, le=90),
+    lon: float = Query(ge=-180, le=180),
+    radius_km: float | None = Query(default=None, gt=0),
+    days: int = Query(default=90, ge=7, le=365),
+    session: Session = Depends(get_session),
+) -> HistoryOut:
+    """One point per day: the cheapest store-level price within the radius.
+
+    This is what the sparkline draws and what "vs the 90-day median" compares
+    against. It reads price_daily (one row per store/day), so a price that has
+    not moved for a fortnight still produces a point for every day.
+    """
+    found = get_product_by_slug(session, product)
+    radius = clamp_radius(radius_km)
+    dlat = radius / 111.0
+    dlon = radius / max(0.01, 111.0 * math.cos(math.radians(lat)))
+    rows = list(
+        session.execute(
+            _HISTORY_SQL,
+            {
+                "product_id": found.id,
+                "days": days,
+                "lat_min": lat - dlat,
+                "lat_max": lat + dlat,
+                "lon_min": lon - dlon,
+                "lon_max": lon + dlon,
+            },
+        ).mappings()
+    )
+    points = [
+        HistoryPoint(
+            day=str(row["day"]),
+            price_cents=row["price_cents"],
+            store_name=row["store_name"],
+        )
+        for row in rows
+    ]
+    values = sorted(point.price_cents for point in points)
+    return HistoryOut(
+        product=ProductOut.model_validate(found),
+        days=days,
+        points=points,
+        median_cents=values[len(values) // 2] if values else None,
+        min_cents=values[0] if values else None,
+        max_cents=values[-1] if values else None,
+        stores_seen=len({point.store_name for point in points if point.store_name}),
+    )
+
+
+@router.get("/deals", response_model=list[DealOut], summary="Cheapest price per unit nearby")
+def deals(
+    lat: float = Query(ge=-90, le=90),
+    lon: float = Query(ge=-180, le=180),
+    radius_km: float | None = Query(default=None, gt=0),
+    metric: str = Query(default="per_litre", pattern="^(per_litre|per_can|price)$"),
+    limit: int = Query(default=20, ge=1, le=100),
+    max_age_hours: int | None = Query(default=None, ge=1, le=720),
+    session: Session = Depends(get_session),
+) -> list[DealOut]:
+    """"Cheapest per litre / per can / per dollar nearby", one row per drink.
+
+    Scans every energy product in one pass (two SQL queries via bulk prices) and
+    keeps each drink's best store, so the board answers "what is the best value
+    around me" rather than "what do the shops near me stock".
+    """
+    radius = clamp_radius(radius_km)
+    since = default_since(max_age_hours or settings.default_max_age_hours)
+    store_pairs = nearby_stores(session, lat, lon, radius, limit=STORE_SCAN_LIMIT)
+    stores = [store for store, _ in store_pairs]
+    distances = {store.id: distance for store, distance in store_pairs}
+    if not stores:
+        return []
+
+    products = list(
+        session.scalars(
+            select(Product).where(
+                Product.is_active.is_(True),
+                Product.category == "energy",
+                Product.status != "rejected",
+            )
+        )
+    )
+    prices = bulk_latest_prices(session, stores, [product.id for product in products], since)
+    store_by_id = {store.id: store for store in stores}
+    product_by_id = {product.id: product for product in products}
+
+    best: dict[int, DealOut] = {}
+    for (store_id, product_id), row in prices.items():
+        store = store_by_id.get(store_id)
+        product = product_by_id.get(product_id)
+        if store is None or product is None or row["price_cents"] <= 0:
+            continue
+        per_litre = row.get("unit_price_cents_per_l")
+        if per_litre is None and product.size_ml and product.pack_count:
+            litres = product.size_ml * product.pack_count / 1000
+            per_litre = round(row["price_cents"] / litres) if litres > 0 else None
+        per_can = (
+            round(row["price_cents"] / product.pack_count) if product.pack_count > 1 else None
+        )
+        key_value = {
+            "per_litre": per_litre,
+            "per_can": per_can if per_can is not None else row["price_cents"],
+            "price": row["price_cents"],
+        }[metric]
+        if key_value is None:
+            continue
+        current = best.get(product.id)
+        if current is not None and key_value >= {
+            "per_litre": current.per_litre_cents,
+            "per_can": current.per_can_cents if current.per_can_cents is not None else current.price_cents,
+            "price": current.price_cents,
+        }[metric]:
+            continue
+        best[product.id] = DealOut(
+            product=ProductOut.model_validate(product),
+            store_id=store.id,
+            store_name=store.name,
+            chain_code=store.chain.code,
+            suburb=store.suburb,
+            distance_km=distances.get(store.id),
+            price_cents=row["price_cents"],
+            price=format_cents(row["price_cents"]),
+            per_can_cents=per_can,
+            per_litre_cents=per_litre,
+            promo_kind=row.get("promo_kind") or "none",
+            age_hours=age_hours(row["observed_at"]),
+        )
+
+    def sort_key(deal: DealOut) -> tuple:
+        value = {
+            "per_litre": deal.per_litre_cents,
+            "per_can": deal.per_can_cents if deal.per_can_cents is not None else deal.price_cents,
+            "price": deal.price_cents,
+        }[metric]
+        return (value if value is not None else 10**9, deal.distance_km or 999)
+
+    return sorted(best.values(), key=sort_key)[:limit]
+
+
+@router.get("/catalogue", response_model=CatalogueOut, summary="Offline catalogue for the app")
+def catalogue(response: Response, request: Request, session: Session = Depends(get_session)) -> CatalogueOut:
+    """Everything the app needs to recognise a can with no signal.
+
+    ~150 products and their barcodes, a few dozen KB gzipped. The app caches it
+    and falls back to it when a barcode lookup cannot reach the server.
+    """
+    from ..models import Barcode
+
+    products = list(
+        session.scalars(
+            select(Product).where(Product.is_active.is_(True), Product.status != "rejected")
+        )
+    )
+    barcodes = {
+        code: slug
+        for code, slug in session.execute(
+            select(Barcode.barcode, Product.slug).join(Product, Product.id == Barcode.product_id)
+        )
+    }
+    payload = CatalogueOut(
+        generated_at=utcnow(),
+        products=[
+            CatalogueProduct(
+                slug=product.slug,
+                brand=product.brand,
+                name=product.name,
+                size_ml=product.size_ml,
+                pack_count=product.pack_count,
+                barcode=product.normalised_barcode or product.barcode,
+            )
+            for product in products
+        ],
+        barcodes=barcodes,
+    )
+    etag = 'W/"catalogue-' + str(len(products)) + "-" + str(len(barcodes)) + "-" + str(len(products) * 31 + len(barcodes)) + '"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return payload
+
+
 @router.get("/products/{slug}", response_model=ProductOut)
 def product_detail(slug: str, session: Session = Depends(get_session)) -> ProductOut:
     return ProductOut.model_validate(get_product_by_slug(session, slug))
@@ -492,6 +703,7 @@ def prices(
     radius_km: float | None = Query(default=None, gt=0),
     max_age_hours: int | None = Query(default=None, ge=1, le=720),
     chain: str | None = None,
+    sort: str = Query(default="price", pattern="^(price|per_can|per_litre)$"),
     limit: int = Query(default=50, ge=1, le=200),
     session: Session = Depends(get_session),
 ) -> ProductPricesOut:
@@ -500,6 +712,14 @@ def prices(
     since = default_since(max_age_hours or settings.default_max_age_hours)
     stores = nearby_stores(session, lat, lon, radius, chain, limit=STORE_SCAN_LIMIT)
     offers = _offers_for_product(session, found, stores, since)
+    if sort != "price":
+        field = "per_can_cents" if sort == "per_can" else "per_litre_cents"
+        offers.sort(
+            key=lambda offer: (
+                getattr(offer, field) if getattr(offer, field) is not None else 10**9,
+                offer.price_cents,
+            )
+        )
     return ProductPricesOut(
         product=ProductOut.model_validate(found),
         cheapest=offers[0] if offers else None,

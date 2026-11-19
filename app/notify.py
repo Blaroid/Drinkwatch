@@ -21,8 +21,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
 
-from .api.deps import bulk_latest_prices, format_cents, haversine_km, utcnow
-from .models import Chain, Notification, PriceAlert, Product, Store
+from .api.deps import bulk_latest_prices, format_cents, haversine_km, nearby_stores, utcnow
+from .models import Chain, Notification, PriceAlert, Product, Store, Watchlist
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +102,10 @@ def _drop_percent(price_cents: int, median_cents: float | None) -> float | None:
 
 
 def _matches(
-    alert: PriceAlert, price_cents: int, median_cents: float | None
+    alert: PriceAlert,
+    price_cents: int,
+    median_cents: float | None,
+    promo_kind: str = "none",
 ) -> tuple[bool, float | None]:
     """Does this price satisfy the alert, and by how much of a drop?
 
@@ -119,6 +122,10 @@ def _matches(
     if alert.max_price_cents is not None and price_cents <= alert.max_price_cents:
         return True, drop
     if alert.min_drop_percent is not None and drop is not None and drop >= alert.min_drop_percent:
+        return True, drop
+    # "Tell me when a special starts": the price does not have to beat any
+    # threshold, the promotion itself is the news.
+    if alert.on_special and promo_kind not in ("none", ""):
         return True, drop
     return False, None
 
@@ -221,7 +228,12 @@ def evaluate_alerts(session: Session, limit: int = 500) -> int:
             if store is None or product is None:
                 continue
             median_cents = medians.get((store.chain_id, product_id))
-            matched, drop = _matches(alert, row["price_cents"], median_cents)
+            matched, drop = _matches(
+                alert,
+                row["price_cents"],
+                median_cents,
+                row.get("promo_kind") or "none",
+            )
             if not matched:
                 continue
             if best is not None and row["price_cents"] >= best["price_cents"]:
@@ -277,4 +289,107 @@ def evaluate_alerts(session: Session, limit: int = 500) -> int:
     session.commit()
     if created:
         log.info("queued %s price alert notification(s)", created)
+    return created
+
+
+DIGEST_MIN_GAP = timedelta(days=6)
+DIGEST_MAX_LINES = 4
+
+
+def weekly_digest(session: Session, limit: int = 500) -> int:
+    """One "what this week looks like" notification per watchlist.
+
+    Runs on a Sunday evening timer. It reuses the same price read as an alert, but
+    the question is different: not "did something cross a threshold" but "where
+    should I buy my usual cans this week". Devices that already have a digest from
+    the last six days are skipped, so a rerun cannot double-post.
+    """
+    watches = list(session.scalars(select(Watchlist).limit(limit)))
+    if not watches:
+        return 0
+
+    now = utcnow()
+    created = 0
+    for watch in watches:
+        slugs = [slug for slug in (watch.slugs or []) if slug]
+        if not slugs:
+            continue
+        recent = session.scalar(
+            select(Notification.id)
+            .where(
+                Notification.device_id == watch.device_id,
+                Notification.kind == "digest",
+                Notification.created_at >= now - DIGEST_MIN_GAP,
+            )
+            .limit(1)
+        )
+        if recent is not None:
+            continue
+
+        products = list(
+            session.scalars(
+                select(Product).where(Product.slug.in_(slugs), Product.status != "rejected")
+            )
+        )
+        if not products:
+            continue
+
+        lat = watch.lat if watch.lat is not None else -31.9523
+        lon = watch.lon if watch.lon is not None else 115.8613
+        stores = [
+            store
+            for store, _ in nearby_stores(session, lat, lon, watch.radius_km or 15, limit=STORE_SCAN_LIMIT)
+        ]
+        if not stores:
+            continue
+        prices = bulk_latest_prices(session, stores, [p.id for p in products], now - FRESH_WINDOW)
+        store_by_id = {store.id: store for store in stores}
+        product_by_id = {product.id: product for product in products}
+
+        cheapest: dict[int, dict[str, Any]] = {}
+        for (store_id, product_id), row in prices.items():
+            store = store_by_id.get(store_id)
+            product = product_by_id.get(product_id)
+            if store is None or product is None:
+                continue
+            best = cheapest.get(product_id)
+            if best is None or row["price_cents"] < best["price_cents"]:
+                cheapest[product_id] = {
+                    "price_cents": row["price_cents"],
+                    "store": store,
+                    "product": product,
+                    "promo_kind": row.get("promo_kind") or "none",
+                }
+        if not cheapest:
+            continue
+
+        lines = []
+        for entry in sorted(cheapest.values(), key=lambda e: e["price_cents"])[:DIGEST_MAX_LINES]:
+            product = entry["product"]
+            label = " ".join(part for part in (product.brand, product.name) if part)
+            if product.size_ml:
+                label += f" {product.size_ml}ml"
+                if product.pack_count > 1:
+                    label += f" x{product.pack_count}"
+            suburb = f" {entry['store'].suburb}" if entry["store"].suburb else ""
+            promo = " (special)" if entry["promo_kind"] not in ("none", "") else ""
+            lines.append(f"{label} {format_cents(entry['price_cents'])} at {entry['store'].name}{suburb}{promo}")
+
+        session.add(
+            Notification(
+                device_id=watch.device_id,
+                kind="digest",
+                title="Your cans this week",
+                body="; ".join(lines),
+                payload={
+                    "products": [entry["product"].slug for entry in cheapest.values()],
+                    "best_total_cents": sum(entry["price_cents"] for entry in cheapest.values()),
+                },
+            )
+        )
+        created += 1
+
+    session.commit()
+    if created:
+        log.info("queued %s weekly digest(s)", created)
     return created

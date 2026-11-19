@@ -51,6 +51,14 @@ def start_scheduler() -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
+    # Sunday evening: "where should I buy my cans this week".
+    scheduler.add_job(
+        safe_digest,
+        CronTrigger(day_of_week="sun", hour=18, minute=10, timezone=TIMEZONE),
+        id="weekly-digest",
+        max_instances=1,
+        coalesce=True,
+    )
     # Alert evaluation also runs after scrapes; this catches crowd-driven changes.
     scheduler.add_job(
         safe_alerts,
@@ -61,6 +69,17 @@ def start_scheduler() -> BackgroundScheduler:
     )
     scheduler.start()
     return scheduler
+
+
+def safe_digest() -> None:
+    from .db import session_scope
+    from .notify import weekly_digest
+
+    try:
+        with session_scope() as session:
+            weekly_digest(session)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("weekly digest failed")
 
 
 def safe_alerts() -> None:

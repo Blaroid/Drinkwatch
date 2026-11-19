@@ -62,10 +62,14 @@ def create_alert(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "give a product_slug or a family_slug"
         )
-    if payload.max_price_cents is None and payload.min_drop_percent is None:
+    if (
+        payload.max_price_cents is None
+        and payload.min_drop_percent is None
+        and not payload.on_special
+    ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "give a max_price_cents or a min_drop_percent",
+            "give a max_price_cents, a min_drop_percent, or on_special",
         )
     location_fields = (payload.lat, payload.lon, payload.radius_km)
     if sum(field is None for field in location_fields) not in (0, len(location_fields)):
@@ -92,6 +96,7 @@ def create_alert(
             PriceAlert.device_id == device.id,
             PriceAlert.max_price_cents == payload.max_price_cents,
             PriceAlert.min_drop_percent == payload.min_drop_percent,
+            PriceAlert.on_special == payload.on_special,
             PriceAlert.product_id == (product.id if product else None),
             PriceAlert.family_slug == (payload.family_slug or (product.family_slug if product else None)),
             PriceAlert.chain_code == payload.chain_code,
@@ -113,6 +118,7 @@ def create_alert(
         store_id=payload.store_id,
         max_price_cents=payload.max_price_cents,
         min_drop_percent=payload.min_drop_percent,
+        on_special=payload.on_special,
         lat=payload.lat,
         lon=payload.lon,
         radius_km=payload.radius_km,
