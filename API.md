@@ -119,9 +119,11 @@ Submit a sighting:
 Rules the API enforces: price 1c..$500, `observed_at` within the last 30 days and
 not in the future, multibuy needs `promo_qty`. Repeat submissions of the same
 price by the same device at the same store within 12h return the existing row
-(201, same id) instead of duplicating. A price more than 2.5x (or under 0.4x) the
-recent median comes back with `status: "needs_review"` until two other users
-confirm it.
+(201, same id) instead of duplicating. A price that is a far outlier against the
+recent prices from the same chain -- widened to the same retail format
+(supermarket / convenience / servo) when that chain has too little history, and
+never counting the reporter's own rows -- comes back with `status:
+"needs_review"` until two other users confirm it.
 
 Confirm or dispute someone else's sighting:
 
