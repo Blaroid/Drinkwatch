@@ -7,10 +7,13 @@ import secrets
 import threading
 import time
 from collections import deque
+from typing import Any, Mapping
 
 from fastapi import Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import settings
 from .models import Device
@@ -120,5 +123,110 @@ class RateLimiter:
                     self._hits.pop(stale, None)
 
 
-write_limiter = RateLimiter(limit=60, window_seconds=3600)  # crowd writes per device/hour
+class DeviceWriteLimiter(RateLimiter):
+    """One hourly bucket per device, whatever route the write came from.
+
+    Call sites pass a per-endpoint label along with the device id ("obs:17",
+    "vote:17", ...). Keying the whole string gave a device one 60/hour quota
+    per endpoint, so a single client could write 6 x 60 times an hour by
+    alternating routes. The label is dropped before the bucket is touched, so
+    every write route spends the same hour; a bare device id already has that
+    shape.
+    """
+
+    def charge(self, key: str, n: int = 1) -> None:
+        super().charge(f"write:{key.rsplit(':', 1)[-1]}", n=n)
+
+
+write_limiter = DeviceWriteLimiter(limit=60, window_seconds=3600)  # writes per device/hour
 read_limiter = RateLimiter(limit=600, window_seconds=60)  # reads per IP/minute
+
+
+READ_METHODS = frozenset({"GET", "HEAD"})
+READ_LIMITED_PREFIX = "/v1/"
+
+
+def _socket_peer(scope: Mapping[str, Any]) -> str:
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+
+
+def _clean_ip(raw: str) -> str:
+    """Drop the port and brackets an X-Forwarded-For hop may carry."""
+    value = raw.strip().strip('"')
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.strip()
+
+
+def _header(scope: Mapping[str, Any], name: bytes) -> str:
+    for key, value in scope.get("headers") or []:
+        if key.lower() == name:
+            return value.decode("latin-1")
+    return ""
+
+
+def _with_client_ip(
+    headers: list[tuple[bytes, bytes]], client_ip: str
+) -> list[tuple[bytes, bytes]]:
+    """Replace the request's X-Forwarded-For with the resolved client only."""
+    kept = [(key, value) for key, value in headers if key.lower() != b"x-forwarded-for"]
+    kept.append((b"x-forwarded-for", client_ip.encode("latin-1")))
+    return kept
+
+
+class ReadRateLimitMiddleware:
+    """Charge the read quota per client IP for every /v1 read.
+
+    It sits in the ASGI stack rather than in a dependency so every /v1 route is
+    covered, including the ones added later: a dependency has to be opted into
+    per router, and the routers that never opted in are how the documented
+    600 reads/minute went unenforced.
+
+    The trust decision for X-Forwarded-For lives here too. Every request leaves
+    this layer carrying a single resolved value, so handlers that key a bucket
+    on the header (device registration) cannot be steered to an arbitrary
+    bucket by a spoofed chain.
+    """
+
+    def __init__(self, app: ASGIApp, *, limiter: RateLimiter, trusted_proxy_hops: int = 0) -> None:
+        self.app = app
+        self.limiter = limiter
+        self.trusted_proxy_hops = max(0, trusted_proxy_hops)
+
+    def client_ip(self, scope: Mapping[str, Any]) -> str:
+        """The address to bill, believing X-Forwarded-For only as far as configured."""
+        peer = _socket_peer(scope)
+        hops = self.trusted_proxy_hops
+        if hops <= 0:
+            return peer
+        chain = [_clean_ip(part) for part in _header(scope, b"x-forwarded-for").split(",")]
+        chain = [part for part in chain if part]
+        if len(chain) < hops:
+            # Shorter than the proxies we trust, so it did not come through
+            # them and the header is whatever the client chose to send.
+            return peer
+        return chain[-hops]
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # Work on a copy: the server hands the same scope to the lifespan and
+        # to error handling, and the sanitised headers are for this request.
+        scope = dict(scope)
+        client_ip = self.client_ip(scope)
+        scope["headers"] = _with_client_ip(scope.get("headers") or [], client_ip)
+        if scope["method"] in READ_METHODS and scope["path"].startswith(READ_LIMITED_PREFIX):
+            try:
+                self.limiter.check("ip:" + client_ip)
+            except HTTPException as exc:
+                # A 429 raised before the router exists, so answer it here
+                # rather than let Starlette turn it into a 500.
+                await JSONResponse(
+                    {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+                )(scope, receive, send)
+                return
+        await self.app(scope, receive, send)

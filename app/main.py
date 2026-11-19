@@ -15,6 +15,7 @@ from . import __version__
 from .api import admin, alerts, appdownload, barcode, basket, crowd, photos, public
 from .config import settings
 from .db import init_db, wait_for_db
+from .security import ReadRateLimitMiddleware, read_limiter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +57,13 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+)
+# Added last so it is the outermost layer: reads are counted (and unauthenticated
+# floods refused) before any other middleware or router work happens.
+app.add_middleware(
+    ReadRateLimitMiddleware,
+    limiter=read_limiter,
+    trusted_proxy_hops=settings.trusted_proxy_hops,
 )
 
 app.include_router(public.router)

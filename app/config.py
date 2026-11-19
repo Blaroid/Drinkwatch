@@ -28,6 +28,12 @@ class Settings:
     woolworths_state: str
     scheduler_enabled: bool
     cors_origins: tuple[str, ...]
+    # How many reverse proxies terminate TLS in front of the API. The read quota
+    # and device registration key their buckets on the client IP, and
+    # X-Forwarded-For is client-writable, so its rightmost entries are believed
+    # only up to the number of proxies we assume appended them. 0 means the API
+    # is exposed directly and the header is ignored.
+    trusted_proxy_hops: int
     default_radius_km: float
     max_radius_km: float
     default_max_age_hours: int
@@ -70,6 +76,7 @@ class Settings:
             woolworths_state=os.environ.get("WOOLWORTHS_STATE", "WA").strip() or "WA",
             scheduler_enabled=_flag("SCHEDULER_ENABLED", True),
             cors_origins=origins,
+            trusted_proxy_hops=max(0, int(os.environ.get("TRUSTED_PROXY_HOPS") or 0)),
             default_radius_km=float(os.environ.get("DEFAULT_RADIUS_KM", "15")),
             max_radius_km=float(os.environ.get("MAX_RADIUS_KM", "100")),
             default_max_age_hours=int(os.environ.get("DEFAULT_MAX_AGE_HOURS", "72")),
