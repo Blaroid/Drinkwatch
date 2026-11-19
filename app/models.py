@@ -71,6 +71,14 @@ class Product(Base):
     """A canonical drink: one row per brand+flavour+size+pack."""
 
     __tablename__ = "products"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('verified', 'pending', 'rejected')", name="ck_products_status"
+        ),
+        CheckConstraint(
+            "source in ('auto', 'manual', 'crowd')", name="ck_products_source"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     slug: Mapped[str] = mapped_column(String(160), unique=True)
@@ -93,7 +101,7 @@ class Product(Base):
     image_url: Mapped[str | None] = mapped_column(String(500))
     normalised_barcode: Mapped[str | None] = mapped_column(String(14))
     category: Mapped[str] = mapped_column(String(40), default="energy")
-    # auto | manual
+    # auto | manual | crowd
     source: Mapped[str] = mapped_column(String(16), default="auto")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -147,6 +155,23 @@ class Observation(Base):
         Index("ix_obs_product_time", "product_id", "observed_at"),
         UniqueConstraint("dedupe_key", name="uq_obs_dedupe"),
         CheckConstraint("price_cents > 0", name="ck_obs_price_positive"),
+        # The read paths assume exactly two shapes: a store row names its store,
+        # a chain row carries only the chain. A chain row with store_id set would
+        # be counted both per-store and chain-wide.
+        CheckConstraint(
+            "(price_scope = 'store' and store_id is not null)"
+            " or (price_scope = 'chain' and store_id is null and chain_id is not null)",
+            name="ck_obs_scope_location",
+        ),
+        CheckConstraint("source in ('scrape', 'crowd')", name="ck_obs_source"),
+        CheckConstraint("price_scope in ('store', 'chain')", name="ck_obs_price_scope"),
+        CheckConstraint(
+            "status in ('accepted', 'needs_review', 'rejected')", name="ck_obs_status"
+        ),
+        CheckConstraint(
+            "promo_kind in ('none', 'special', 'multibuy', 'clearance')",
+            name="ck_obs_promo_kind",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -209,6 +234,11 @@ class Report(Base):
 
 class ScrapeRun(Base):
     __tablename__ = "scrape_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('running', 'ok', 'error')", name="ck_scrape_runs_status"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     chain_code: Mapped[str] = mapped_column(String(32))
