@@ -130,6 +130,7 @@ Full reference: [API.md](API.md). Interactive: `/docs`.
 | `VEHICLE_L_PER_100KM` | 8.5 | fuel estimate for route plans |
 | `MAX_BUDGET_CENTS` | 20000 | cap for the budget optimiser |
 | `DAILY_CAFFEINE_LIMIT_MG` | 400 | guideline used by the gauge |
+| `TRUSTED_PROXY_HOPS` | 0 | proxies in front of the API; how much of `X-Forwarded-For` to believe |
 
 ## Data resets
 

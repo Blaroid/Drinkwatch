@@ -7,6 +7,15 @@ All money is integer cents. All timestamps are ISO 8601 UTC.
 Read endpoints are public. Writes need a device token. Rate limits:
 600 reads/minute/IP, 60 writes/hour/device.
 
+Both are enforced. Every `GET`/`HEAD` under `/v1/` is charged to the calling
+IP (a sliding minute, charged before routing, so a new route cannot forget it).
+`X-Forwarded-For` is only believed for as many rightmost hops as
+`TRUSTED_PROXY_HOPS` declares (default 0: the header is ignored and the socket
+peer is used). Every write route shares one hourly bucket per device - scanning
+a barcode, voting, uploading a photo and submitting a sighting all spend the
+same 60 - and a receipt batch is charged once for its whole docket rather than
+once per line.
+
 ## Widget contract (the thing the app should call)
 
     GET /v1/widget?lat=-31.9523&lon=115.8613&radius_km=15&products=monster-green-500ml,v-original-500ml
@@ -173,7 +182,6 @@ price adds it to the deal history and rejecting one takes it back out.
     {"detail": "unknown product slug: foo"}    // 404, 422, 409, 429, 401, 403
 
 429 responses carry `Retry-After`. 503 on /v1/admin/* means ADMIN_TOKEN is unset.
-
 
 ## Scanning and onboarding
 
