@@ -198,25 +198,42 @@ def family_products(session: Session, key: str) -> list[Product]:
 
 
 def prune_bundles(bundles: list[Bundle]) -> list[Bundle]:
-    """Drop dominated options: cheaper or equal cost for at least as many cans."""
-    ordered = sorted(bundles, key=lambda bundle: (bundle.units, bundle.cost_cents))
+    """Drop options another bundle beats on both cans and money.
+
+    An option is redundant when some other option hands over at least as many
+    cans for no more money: every plan that buys the dominated one can buy the
+    dominating one instead, for the same or less, so the survivors are the
+    Pareto set of (units, cost) points.
+
+    Dominance has to be read this way round. The older test asked for an option
+    with *fewer* cans and no more money, which dropped every 4-pack and multibuy
+    whose total price exceeded one can's - nearly all of them, since a pack's
+    total almost always is. The optimiser then only ever saw singles and
+    "cheapest combination" degenerated into quantity x cheapest single.
+    Keeping the lowest unit price alone would overshoot the other way: a pack at
+    100c/can still loses to a 470c single when the shopper wants one can, so a
+    dearer-per-can option with fewer cans stays in the set.
+    """
+    ordered = sorted(bundles, key=lambda bundle: (-bundle.units, bundle.cost_cents))
     kept: list[Bundle] = []
     for bundle in ordered:
-        dominated = False
-        for other in kept:
-            if other.units <= bundle.units and other.cost_cents <= bundle.cost_cents:
-                if other.units < bundle.units or other.cost_cents < bundle.cost_cents:
-                    dominated = True
-                    break
+        dominated = any(
+            other.units >= bundle.units
+            and other.cost_cents <= bundle.cost_cents
+            and (other.units > bundle.units or other.cost_cents < bundle.cost_cents)
+            for other in kept
+        )
         if not dominated:
             kept.append(bundle)
-    return kept
+    return sorted(kept, key=lambda bundle: (bundle.units, bundle.cost_cents))
 
 
 def cheapest_quantity_plan(bundles: list[Bundle], quantity: int) -> tuple[int, list[tuple[Bundle, int]]] | None:
     """Cheapest way to buy at least 'quantity' cans (integer coin change).
 
     Returns (total_cents, [(bundle, count), ...]) or None when nothing can reach it.
+    Overshoot is allowed and charged as bought, so a 4-pack can beat three
+    singles and a multibuy can beat the same cans at shelf price.
     """
     if quantity <= 0:
         return 0, []

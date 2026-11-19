@@ -148,8 +148,29 @@ def test_prune_bundles_keeps_a_bulk_option_that_is_cheaper_in_total() -> None:
     single = Bundle(1, 400, 160.0, "single")
     bulk = Bundle(4, 300, 640.0, "4-pack")
 
-    # Neither dominates: the bulk pack has more cans for less money.
-    assert prune_bundles([single, bulk]) == [single, bulk]
+    # Four cans for less than one can costs: the single is never needed, so the
+    # prune drops it and keeps the pack.
+    assert prune_bundles([single, bulk]) == [bulk]
+
+
+def test_prune_bundles_keeps_a_pack_that_only_wins_per_can() -> None:
+    single = Bundle(1, 470, 160.0, "single")
+    four_pack = Bundle(4, 1050, 640.0, "4-pack")
+
+    # The pack is cheaper per can but costs more in total, so neither dominates:
+    # the pack pays off at four cans, the single at one.
+    assert prune_bundles([single, four_pack]) == [single, four_pack]
+
+
+def test_prune_bundles_keeps_a_multibuy_over_the_packs_beside_it() -> None:
+    # Live Coles prices for monster-ultra-500ml: single $4.70, 2 for $7.90 and a
+    # 4-pack at $10.50. The 4-pack is cheapest per can, but the 2-for deal is
+    # cheaper in total, so the Pareto set holds all three.
+    single = Bundle(1, 470, 160.0, "single")
+    deal = Bundle(2, 790, 320.0, "2 x 1-pack deal")
+    four_pack = Bundle(4, 1050, 640.0, "4-pack")
+
+    assert prune_bundles([four_pack, single, deal]) == [single, deal, four_pack]
 
 
 def test_prune_bundles_keeps_exact_duplicates() -> None:
@@ -161,10 +182,10 @@ def test_prune_bundles_keeps_exact_duplicates() -> None:
 
 
 def test_prune_bundles_sorts_by_units() -> None:
-    bulk = Bundle(4, 300, 640.0, "4-pack")
-    single = Bundle(1, 400, 160.0, "single")
+    four_pack = Bundle(4, 1050, 640.0, "4-pack")
+    single = Bundle(1, 470, 160.0, "single")
 
-    assert prune_bundles([bulk, single]) == [single, bulk]
+    assert prune_bundles([four_pack, single]) == [single, four_pack]
 
 
 def test_prune_bundles_empty() -> None:
@@ -196,13 +217,6 @@ def test_plan_ignores_a_dearer_single_in_the_same_store() -> None:
     assert cheapest_quantity_plan([dear, cheap], 3) == (750, [(cheap, 3)])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "prune_bundles drops the 4-pack before the DP ever sees it, so the plan "
-        "buys four singles for more than the pack costs (see REPORT.md)"
-    ),
-)
 def test_plan_uses_a_bulk_pack_when_it_is_cheaper() -> None:
     single = Bundle(1, 329, 160.0, "single")
     four_pack = Bundle(4, 1200, 640.0, "4-pack")
@@ -210,6 +224,29 @@ def test_plan_uses_a_bulk_pack_when_it_is_cheaper() -> None:
     plan = cheapest_quantity_plan([single, four_pack], 4)
 
     assert plan == (1200, [(four_pack, 1)])
+
+
+def test_plan_uses_the_live_coles_packs_and_multibuy() -> None:
+    # The evidence case from the audit: single $4.70, 4-pack $10.50 and 2 for
+    # $7.90. Absolute-price pruning kept the single alone and charged $18.80 for
+    # four cans; the 4-pack has to win at four.
+    single = Bundle(1, 470, 160.0, "single")
+    deal = Bundle(2, 790, 320.0, "2 x 1-pack deal")
+    four_pack = Bundle(4, 1050, 640.0, "4-pack")
+
+    assert cheapest_quantity_plan([single, deal, four_pack], 4) == (1050, [(four_pack, 1)])
+    # Two cans go to the multibuy, which undercuts two singles and the 4-pack.
+    assert cheapest_quantity_plan([single, deal, four_pack], 2) == (790, [(deal, 1)])
+
+
+def test_plan_still_keeps_the_at_least_quantity_semantics() -> None:
+    # A cheap-per-can 6-pack must not replace the single for a one-can basket,
+    # and may still overshoot when six cans are wanted.
+    single = Bundle(1, 470, 160.0, "single")
+    six_pack = Bundle(6, 600, 960.0, "6-pack")
+
+    assert cheapest_quantity_plan([single, six_pack], 1) == (470, [(single, 1)])
+    assert cheapest_quantity_plan([single, six_pack], 6) == (600, [(six_pack, 1)])
 
 
 # --- maximise_caffeine -------------------------------------------------------
