@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from sqlalchemy import and_, bindparam, func, or_, select, text
+from sqlalchemy import and_, bindparam, case, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from .. import __version__
@@ -413,9 +413,19 @@ def widget(
         slugs = [s.strip() for s in products.split(",") if s.strip()][:8]
         catalogue = [get_product_by_slug(session, slug) for slug in slugs]
     else:
-        # No explicit list: most-observed (i.e. most stocked) energy drinks.
+        # No explicit list: the energy drinks on the most shelves. Count distinct
+        # stores, not sightings — a chain scraped four times a day would otherwise
+        # make seven shops look like twenty-eight and bury servo-only drinks.
+        # Chain-wide online rows (Woolworths/Coles) have no store_id, so count
+        # each such chain once; otherwise the two biggest chains score zero and
+        # fall out of the default list even though they stock the drink.
+        chain_wide = case((Observation.store_id.is_(None), Observation.chain_id))
+        stocked_stores = (
+            func.count(func.distinct(Observation.store_id))
+            + func.count(func.distinct(chain_wide))
+        )
         popularity = (
-            select(Observation.product_id, func.count().label("hits"))
+            select(Observation.product_id, stocked_stores.label("stores"))
             .where(Observation.observed_at >= since)
             .group_by(Observation.product_id)
             .subquery()
@@ -425,7 +435,7 @@ def widget(
                 select(Product)
                 .join(popularity, popularity.c.product_id == Product.id)
                 .where(Product.is_active.is_(True), Product.category == "energy")
-                .order_by(popularity.c.hits.desc(), Product.brand, Product.name)
+                .order_by(popularity.c.stores.desc(), Product.brand, Product.name)
                 .limit(60)
             )
         )
