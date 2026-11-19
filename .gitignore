@@ -6,3 +6,10 @@ __pycache__/
 pgdata/
 *.log
 apk/
+
+# Full database dumps stay out of the repo: they carry devices, alerts,
+# caffeine logs and notifications. They live on the redmax disk instead
+# (~/mnt/redmax/drinkwatch/repo-dumps). The curated barcodes dump is a data
+# record the README points at, so only the gzipped pg_dump files are ignored.
+backups/*.sql.gz
+backups/*.dump
