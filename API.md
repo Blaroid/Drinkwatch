@@ -207,6 +207,14 @@ Accepts EAN-13, GTIN-14 (Woolworths' 14-digit codes), UPC-A and retailer-interna
 codes; all forms of the same product resolve. `checksum_ok` is advisory - some
 retailer codes are not valid GTINs.
 
+Coverage follows what the chains publish. Woolworths and Coles put the printed
+GTIN on their product-detail pages, and the scrapers index those codes, so a can
+bought at either chain resolves. SpudShed publishes no GTIN, and IGA has no
+chain-wide feed, so those cans (and any code not yet indexed) return
+`found: false`; the app should then collect the name and size off the label and
+POST /v1/products/pending. When the crowd has already identified that code, the
+same scan resolves immediately and only attaches the price.
+
     POST /v1/products/pending            (device auth)
     {"barcode": "9300633099999", "name": "V Energy Berry 500mL", "brand": "V",
      "size_ml": 500, "pack_count": 1, "photo_token": "...", "store_id": 556,
