@@ -353,9 +353,17 @@ class RoutePlanOut(BaseModel):
 class AlertIn(BaseModel):
     product_slug: str | None = None
     family_slug: str | None = None
-    max_price_cents: int = Field(gt=0, le=50000)
+    # At least one trigger is required: an absolute ceiling and/or a relative drop
+    # below the product's 30-day median. One may now be omitted; old clients that
+    # always send max_price_cents behave exactly as before.
+    max_price_cents: int | None = Field(default=None, gt=0, le=50000)
+    min_drop_percent: int | None = Field(default=None, ge=1, le=90)
     chain_code: str | None = Field(default=None, max_length=32)
     store_id: int | None = None
+    # Location filter for "alert me about shops near me"; all three or none.
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    radius_km: float | None = Field(default=None, gt=0)
 
 
 class AlertOut(BaseModel):
@@ -366,7 +374,11 @@ class AlertOut(BaseModel):
     family_slug: str | None = None
     chain_code: str | None = None
     store_id: int | None = None
-    max_price_cents: int
+    max_price_cents: int | None = None
+    min_drop_percent: int | None = None
+    lat: float | None = None
+    lon: float | None = None
+    radius_km: float | None = None
     is_active: bool
     last_notified_at: datetime | None = None
     created_at: datetime

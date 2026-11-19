@@ -314,7 +314,15 @@ class PriceAlert(Base):
     family_slug: Mapped[str | None] = mapped_column(String(160))
     chain_code: Mapped[str | None] = mapped_column(String(32))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"))
-    max_price_cents: Mapped[int] = mapped_column(Integer)
+    # At least one of the two triggers is set (ck_alert_trigger in 009):
+    # an absolute ceiling, and/or a fall of min_drop_percent below the 30-day median.
+    max_price_cents: Mapped[int | None] = mapped_column(Integer)
+    min_drop_percent: Mapped[int | None] = mapped_column(SmallInteger)
+    # Location filter, all three or none (ck_alert_location in 009). None means
+    # "every active store", which is what alerts did before the columns existed.
+    lat: Mapped[float | None] = mapped_column(Float)
+    lon: Mapped[float | None] = mapped_column(Float)
+    radius_km: Mapped[float | None] = mapped_column(Float)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
