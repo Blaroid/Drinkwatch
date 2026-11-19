@@ -23,4 +23,9 @@ select (o.observed_at at time zone 'Australia/Perth')::date,
   from observations o
  where o.status = 'accepted'
  group by 1, 2, 3
-on conflict (day, chain_id, product_id) do nothing;
+-- No conflict target: 006 predates the per-store key that 012 installs, and a
+-- replay runs after 012 has replaced this file's 3-column primary key. Naming
+-- (day, chain_id, product_id) here makes Postgres reject the whole batch at
+-- parse time; without a target, the insert resolves against whichever unique
+-- key the database has. 012 owns the final backfill.
+on conflict do nothing;
