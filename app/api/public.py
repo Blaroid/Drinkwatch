@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from sqlalchemy import and_, bindparam, case, func, or_, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.expression import ColumnElement
+from sqlalchemy.sql.selectable import Subquery
 
 from .. import __version__
 from ..config import settings
@@ -111,6 +113,47 @@ def _label(product: Product) -> str:
     return label
 
 
+def _offer(
+    product: Product,
+    store: Store,
+    distance: float | None,
+    obs: Observation,
+    now: datetime,
+) -> OfferOut:
+    """Render one observation as the public offer row.
+
+    Shared by the single-product path and the batched suggestion path so both
+    produce byte-identical rows.
+    """
+    per_can = round(obs.price_cents / product.pack_count) if product.pack_count > 1 else None
+    per_litre = obs.unit_price_cents_per_l
+    if per_litre is None and product.size_ml and product.pack_count:
+        litres = product.size_ml * product.pack_count / 1000
+        per_litre = round(obs.price_cents / litres) if litres > 0 else None
+    return OfferOut(
+        store_id=store.id,
+        store_name=store.name,
+        chain_code=store.chain.code,
+        chain_name=store.chain.name,
+        chain_kind=store.chain.kind,
+        suburb=store.suburb,
+        distance_km=distance,
+        price_cents=obs.price_cents,
+        price=format_cents(obs.price_cents),
+        was_price_cents=obs.was_price_cents,
+        per_can_cents=per_can,
+        per_litre_cents=per_litre,
+        promo_kind=obs.promo_kind,
+        promo_qty=obs.promo_qty,
+        promo_total_cents=obs.promo_total_cents,
+        in_stock=obs.in_stock,
+        source=obs.source,
+        price_scope=obs.price_scope,
+        age_hours=age_hours(obs.observed_at, now),
+        observed_at=obs.observed_at,
+    )
+
+
 def _offers_for_product(
     session: Session,
     product: Product,
@@ -123,43 +166,13 @@ def _offers_for_product(
     now = utcnow()
     offers: list[OfferOut] = []
     for store_id, current in observations.items():
-        store, distance = by_id.get(store_id, (None, None))
-        if store is None:
+        store_pair = by_id.get(store_id)
+        if store_pair is None:
             continue
-        # `latest_prices` already chose the fresher of the store sighting and
-        # the chain-wide online price, so a stale row cannot set this offer.
-        obs = current.primary
-        per_can = (
-            round(obs.price_cents / product.pack_count) if product.pack_count > 1 else None
-        )
-        per_litre = obs.unit_price_cents_per_l
-        if per_litre is None and product.size_ml and product.pack_count:
-            litres = product.size_ml * product.pack_count / 1000
-            per_litre = round(obs.price_cents / litres) if litres > 0 else None
-        offers.append(
-            OfferOut(
-                store_id=store.id,
-                store_name=store.name,
-                chain_code=store.chain.code,
-                chain_name=store.chain.name,
-                chain_kind=store.chain.kind,
-                suburb=store.suburb,
-                distance_km=distance,
-                price_cents=obs.price_cents,
-                price=format_cents(obs.price_cents),
-                was_price_cents=obs.was_price_cents,
-                per_can_cents=per_can,
-                per_litre_cents=per_litre,
-                promo_kind=obs.promo_kind,
-                promo_qty=obs.promo_qty,
-                promo_total_cents=obs.promo_total_cents,
-                in_stock=obs.in_stock,
-                source=obs.source,
-                price_scope=obs.price_scope,
-                age_hours=age_hours(obs.observed_at, now),
-                observed_at=obs.observed_at,
-            )
-        )
+        store, distance = store_pair
+        # #4 gives every store the fresher of its own sighting and the chain
+        # price; #14 renders it through one shared helper.
+        offers.append(_offer(product, store, distance, current.primary, now))
     offers.sort(key=lambda offer: (offer.price_cents, offer.distance_km or 999))
 
     group_ids = product_group_ids(session, product)
@@ -179,6 +192,176 @@ def _offers_for_product(
             deal=_classify_deal(offer.price_cents, median, minimum),
         )
     return offers
+
+
+# The observation columns a batched price lookup needs to rebuild a row; the
+# same set latest_prices() hands back to _offer().
+_PRICE_COLUMNS = (
+    Observation.id,
+    Observation.store_id,
+    Observation.chain_id,
+    Observation.product_id,
+    Observation.price_cents,
+    Observation.was_price_cents,
+    Observation.unit_price_cents_per_l,
+    Observation.promo_kind,
+    Observation.promo_qty,
+    Observation.promo_total_cents,
+    Observation.in_stock,
+    Observation.source,
+    Observation.price_scope,
+    Observation.observed_at,
+)
+
+
+def _latest_statement(keys: list[ColumnElement], conditions: list[ColumnElement]) -> Subquery:
+    """Accepted prices ranked per ``(product_id, *keys)``; row 1 is the freshest.
+
+    A window function is the portable spelling of the ``distinct on`` the price
+    helpers use, so the same statement also runs on SQLite in tests. Ordering is
+    the one ``latest_prices()`` applies: newest sighting, then highest id.
+    """
+    return (
+        select(
+            *_PRICE_COLUMNS,
+            func.row_number()
+            .over(
+                partition_by=[Observation.product_id, *keys],
+                order_by=(Observation.observed_at.desc(), Observation.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(*conditions)
+        .subquery()
+    )
+
+
+def _latest_rows(
+    session: Session, keys: list[ColumnElement], conditions: list[ColumnElement]
+) -> list[dict]:
+    """Freshest accepted observation per ``(product_id, *keys)``, in one query."""
+    ranked = _latest_statement(keys, conditions)
+    rows = session.execute(select(ranked).where(ranked.c.rn == 1)).mappings()
+    return [dict(row) for row in rows]
+
+
+def _row_observation(row: dict) -> Observation:
+    """Rebuild a detached Observation from a batched row (drops the rank column)."""
+    return Observation(**{key: value for key, value in row.items() if key != "rn"})
+
+
+def _suggest_offers(
+    session: Session,
+    products: list[Product],
+    store_distances: list[tuple[Store, float]],
+    since: datetime,
+) -> dict[int, OfferOut]:
+    """Cheapest offer for each product, in a fixed number of queries.
+
+    The suggestion list only needs one offer per candidate, but
+    ``_offers_for_product()`` costs roughly four round trips - two of them just
+    to resolve the alias group - which was being paid for each of up to 60
+    candidates. Here the whole candidate set shares one alias lookup and one
+    price query per scope, then reduces with the same ``(price, distance)``
+    rule and tie-break as ``_offers_for_product()[0]``.
+
+    Deal stats are deliberately not fetched: the widget never serialises
+    ``OfferOut.stats``, so the 90-day percentile query would be pure overhead.
+    """
+    if not products or not store_distances:
+        return {}
+    stores = [store for store, _ in store_distances]
+    by_id = {store.id: (store, distance) for store, distance in store_distances}
+
+    # Same alias groups product_group_ids() builds, once for the whole set.
+    roots = {product.canonical_product_id or product.id for product in products}
+    members: dict[int, list[int]] = {root: [root] for root in roots}
+    for product_id, root_id in session.execute(
+        select(Product.id, Product.canonical_product_id).where(
+            Product.canonical_product_id.in_(roots)
+        )
+    ):
+        members[root_id].append(product_id)
+    product_ids = sorted({product_id for ids in members.values() for product_id in ids})
+    roots_of: dict[int, list[int]] = {}
+    for root, ids in members.items():
+        for product_id in ids:
+            roots_of.setdefault(product_id, []).append(root)
+
+    store_rows = _latest_rows(
+        session,
+        [Observation.store_id],
+        [
+            Observation.store_id.in_([store.id for store in stores]),
+            Observation.product_id.in_(product_ids),
+            Observation.status == "accepted",
+            Observation.observed_at >= since,
+        ],
+    )
+    chain_rows = _latest_rows(
+        session,
+        [Observation.chain_id],
+        [
+            Observation.store_id.is_(None),
+            Observation.chain_id.in_({store.chain_id for store in stores}),
+            Observation.product_id.in_(product_ids),
+            Observation.status == "accepted",
+            Observation.observed_at >= since,
+        ],
+    )
+
+    def freshest_per_root(rows: list[dict], key: str) -> dict[int, dict[int, dict]]:
+        """Collapse alias siblings: per root and scope key, keep the newest row."""
+        best: dict[int, dict[int, dict]] = {}
+        for row in rows:
+            for root in roots_of[row["product_id"]]:
+                by_key = best.setdefault(root, {})
+                current = by_key.get(row[key])
+                if current is None or (row["observed_at"], row["id"]) > (
+                    current["observed_at"],
+                    current["id"],
+                ):
+                    by_key[row[key]] = row
+        return best
+
+    in_store = freshest_per_root(store_rows, "store_id")
+    in_chain = freshest_per_root(chain_rows, "chain_id")
+
+    now = utcnow()
+    best_by_product: dict[int, OfferOut] = {}
+    for product in products:
+        root = product.canonical_product_id or product.id
+        observations: dict[int, Observation] = {}
+        # Store-scoped rows first in store_id order, then the chain-wide price
+        # for stores without one: the order latest_prices() returns, which is
+        # also the tie-break the offer sort relies on. If latest_prices() ever
+        # prefers the freshest scope instead of the store row (see wt/p1b), this
+        # reduce has to follow it or suggests will disagree with the rows above.
+        for store_id, row in sorted(in_store.get(root, {}).items()):
+            observations[store_id] = _row_observation(row)
+        for store in stores:
+            if store.id in observations:
+                continue
+            row = in_chain.get(root, {}).get(store.chain_id)
+            if row is not None:
+                observations[store.id] = _row_observation(
+                    {**row, "store_id": store.id, "price_scope": "chain"}
+                )
+
+        winner: tuple[Store, float, Observation] | None = None
+        for store_id, obs in observations.items():
+            store_pair = by_id.get(store_id)
+            if store_pair is None:
+                continue
+            store, distance = store_pair
+            if winner is None or (obs.price_cents, distance or 999) < (
+                winner[2].price_cents,
+                winner[1] or 999,
+            ):
+                winner = (store, distance, obs)
+        if winner is not None:
+            best_by_product[product.id] = _offer(product, winner[0], winner[1], winner[2], now)
+    return best_by_product
 
 
 @router.get("/meta", response_model=MetaOut, summary="Service metadata and data freshness")
@@ -495,12 +678,13 @@ def widget(
             )
         )
         ranked = []
+        best_offers = _suggest_offers(session, candidates, stores, since)
         for candidate in candidates:
-            offers = _offers_for_product(session, candidate, stores, since)
-            if not offers:
+            best = best_offers.get(candidate.id)
+            if best is None:
                 continue
             same_brand = 0 if candidate.brand.lower() in wanted_brands else 1
-            ranked.append((same_brand, offers[0].price_cents, candidate, offers[0]))
+            ranked.append((same_brand, best.price_cents, candidate, best))
         ranked.sort(key=lambda row: (row[0], row[1]))
         for _, _, candidate, best in ranked[:suggest]:
             freshest = _freshest(freshest, best.observed_at)
