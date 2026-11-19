@@ -140,12 +140,12 @@ a dump of the old table is in `backups/barcodes-*.sql`. New codes arrive from
 crowd scans (`POST /v1/products/pending`) and from the next scrape of a chain
 that publishes them, and `scripts/backfill.py` re-indexes whatever is present.
 
-The rows the smoke test left behind are removed with
-`scripts/purge_smoke.py --apply`, which reports the counts first: a `smoke-test`
-device per run (the crowd leaderboard's top three), its sightings, photos and
-alerts, and the pending "Smoke Test" can in the review queue. From now on every
-run's rows carry the markers in `scripts/smoke.py`, so `smoke.py --cleanup` finds
-the ones from the current run.
+The rows the smoke test left behind were purged on 2026-11-19 with
+`scripts/purge_smoke.py --apply` (a dry run by default): a `smoke-test` device
+per run (the crowd leaderboard's top three), its sightings, photos and alerts,
+and the pending "Smoke Test" can in the review queue. From now on every run's
+rows carry the markers in `scripts/smoke.py`, so `smoke.py --cleanup` finds the
+ones from the current run.
 
 ## Operations
 
@@ -163,15 +163,19 @@ the ones from the current run.
   backup disk):
   `docker compose exec -T db pg_dump -U drinkwatch drinkwatch | gzip > backups/backup-$(date +%F).sql.gz`
 * **Restore drill** - a restore that leaves `schema_migrations` empty makes the
-  next boot replay the whole chain, so practise it against the day's dump:
-  `gunzip -c backups/backup-2026-11-19.sql.gz | docker compose exec -T db psql -U drinkwatch -d drinkwatch`,
-  then `python scripts/migrate.py` and start the API so the entrypoint's schema
-  check compares keys and constraints, not just columns.
+  next boot replay the whole chain, so practise it against the day's dump in a
+  scratch database, never the live one:
+  `docker compose exec -T db createdb -U drinkwatch restore_drill`, then
+  `gunzip -c backups/backup-2026-11-19.sql.gz | docker compose exec -T db psql -U drinkwatch -d restore_drill`,
+  then run `scripts/migrate.py` with `DATABASE_URL` pointed at `restore_drill`
+  and start the API so the entrypoint's schema check compares keys and
+  constraints, not just columns.
 * **Smoke test** - `docker compose exec -T api python scripts/smoke.py http://127.0.0.1:8000`
   exercises 30 read/crowd/plan paths. It writes real rows: a device, crowd
-  sightings, a photo and a pending product, each carrying the markers in the
-  script header. `python scripts/smoke.py --cleanup` reports them and
-  `--cleanup --apply` deletes them, along with the `price_daily` rows they wrote;
+  sightings, a photo and a pending product, tagged with the markers in the
+  script header (device name and version, note prefix, product title).
+  `python scripts/smoke.py --cleanup` reports them and `--cleanup --apply`
+  deletes them, along with the `price_daily` rows they wrote;
   `python scripts/purge_smoke.py --apply` is the same cleanup for a backlog.
 
 ## Data model notes
