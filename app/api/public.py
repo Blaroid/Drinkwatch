@@ -25,6 +25,7 @@ from ..schemas import (
     WidgetItemOut,
     WidgetOut,
 )
+from .crowd import fold_crowd_sightings
 from .deps import (
     age_hours,
     clamp_radius,
@@ -468,9 +469,14 @@ def observations(
         stmt = stmt.where(Observation.source == source)
     stmt = stmt.order_by(Observation.observed_at.desc()).limit(limit)
     rows = list(session.scalars(stmt))
-    store_ids = {r.store_id for r in rows if r.store_id is not None}
+    # Repeat crowd reports of one price are one sighting with a count, not five
+    # rows in a row: this is the list the app renders as "recent sightings".
+    # Folding after the SQL limit means a page can show fewer than `limit` rows.
+    folded = fold_crowd_sightings(rows)
+    store_ids = {r.store_id for r, _ in folded if r.store_id is not None}
+    product_ids = {r.product_id for r, _ in folded}
     stores = {s.id: s for s in session.scalars(select(Store).where(Store.id.in_(store_ids)))}
-    prods = {p.id: p for p in session.scalars(select(Product).where(Product.id.in_({r.product_id for r in rows})))}
+    prods = {p.id: p for p in session.scalars(select(Product).where(Product.id.in_(product_ids)))}
     return [
         {
             "id": row.id,
@@ -489,8 +495,9 @@ def observations(
             "price_scope": row.price_scope,
             "observed_at": row.observed_at,
             "note": row.note,
+            "sightings": sightings,
         }
-        for row in rows
+        for row, sightings in folded
     ]
 
 

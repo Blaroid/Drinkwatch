@@ -88,24 +88,112 @@ VOTE_COUNTS = (
 )
 
 
+# Two devices reporting the same price at the same shop within the hour are one
+# fact, not two. Folding them keeps the extra reports useful as corroboration --
+# the feed says "$3.50, 5 sightings" -- instead of letting five identical rows
+# compete to be the store's "latest" price.
+SIGHTING_FOLD_WINDOW = timedelta(hours=1)
+
+# store, product, price: what a sighting actually asserts. The hour around it is
+# what decides whether another row is the same assertion or a new one.
+SightingKey = tuple[int | None, int, int]
+
+
+def _sighting_key(observation: Observation) -> SightingKey:
+    return (observation.store_id, observation.product_id, observation.price_cents)
+
+
+def fold_crowd_sightings(
+    observations: list[Observation],
+) -> list[tuple[Observation, int]]:
+    """Collapse repeat crowd reports of one price at one store inside an hour.
+
+    Returns the surviving rows newest-first, each with the number of sightings it
+    stands for. The newest row of a group is the representative because that is
+    the one a client would show as "latest"; older rows inside the window are
+    dropped from the response, not from the ledger -- they remain separate
+    devices' reports, and their count is the corroboration this returns.
+
+    Scrape rows never fold: a scraper writes one row per price change, so two
+    scrape rows at the same price are two real observations, and a price change
+    is exactly what the feed exists to show.
+    """
+    # All callers order newest-first; sort defensively so a caller that forgets
+    # cannot fold an older report over a newer one.
+    ordered = sorted(observations, key=lambda row: (row.observed_at, row.id or 0), reverse=True)
+    kept: list[Observation] = []
+    sightings: list[int] = []
+    group_at: dict[SightingKey, int] = {}
+    for row in ordered:
+        if row.source == "crowd":
+            position = group_at.get(_sighting_key(row))
+            if position is not None:
+                anchor = kept[position]
+                if anchor.observed_at - row.observed_at < SIGHTING_FOLD_WINDOW:
+                    sightings[position] += 1
+                    continue
+            group_at[_sighting_key(row)] = len(kept)
+        kept.append(row)
+        sightings.append(1)
+    return list(zip(kept, sightings))
+
+
+def _sightings_in_window(session: Session, observation: Observation) -> int:
+    """How many crowd reports back this exact price at this store.
+
+    The window ends at the report itself rather than at "now", so a receipt
+    sighting submitted for an hour ago is folded with the reports it actually
+    agrees with instead of with whatever happened since. Rejected rows do not
+    count: they are reports we have already decided were wrong.
+    """
+    total = session.scalar(
+        select(func.count())
+        .select_from(Observation)
+        .where(
+            Observation.source == "crowd",
+            Observation.status != "rejected",
+            Observation.store_id == observation.store_id,
+            Observation.product_id == observation.product_id,
+            Observation.price_cents == observation.price_cents,
+            Observation.observed_at > observation.observed_at - SIGHTING_FOLD_WINDOW,
+            Observation.observed_at <= observation.observed_at,
+        )
+    )
+    return int(total or 0)
+
+
 def _serialize(session: Session, observations: list[Observation]) -> list[ObservationOut]:
     if not observations:
         return []
-    ids = [obs.id for obs in observations]
-    counts = {
+    rows = fold_crowd_sightings(observations)
+    ids = [obs.id for obs, _ in rows]
+    votes = {
         row.observation_id: (int(row.confirms or 0), abs(int(row.disputes or 0)))
         for row in session.execute(
             select(VOTE_COUNTS).where(VOTE_COUNTS.c.observation_id.in_(ids))
         )
     }
     out = []
-    for obs in observations:
+    for obs, sightings in rows:
         item = ObservationOut.model_validate(obs)
-        confirms, disputes = counts.get(obs.id, (0, 0))
+        confirms, disputes = votes.get(obs.id, (0, 0))
         item.confirms = confirms
         item.disputes = disputes
+        item.sightings = sightings
         out.append(item)
     return out
+
+
+def _serialize_one(session: Session, observation: Observation) -> ObservationOut:
+    """Serialize a single row, counting every report held in the ledger.
+
+    A list response can only count the rows it was handed, but a write response
+    knows the row it just stored, so it can afford the tally query and must not
+    report a sighting as uncorroborated when four other devices said the same.
+    """
+    item = _serialize(session, [observation])[0]
+    item.sightings = _sightings_in_window(session, observation)
+    return item
 
 
 # How a crowd price is judged before it is allowed to influence everyone else.
@@ -262,7 +350,7 @@ def submit_observation(
         .order_by(Observation.observed_at.desc())
     )
     if recent is not None:
-        return _serialize(session, [recent])[0]
+        return _serialize_one(session, recent)
 
     reference = _reference_price(session, product, store, device.id)
     needs_review = reference is not None and reference.is_outlier(payload.price_cents)
@@ -320,7 +408,7 @@ def submit_observation(
             observed_at=observed_at,
         )
     session.commit()
-    return _serialize(session, [observation])[0]
+    return _serialize_one(session, observation)
 
 
 @router.post("/observations/{observation_id}/vote", response_model=ObservationOut)
@@ -362,7 +450,7 @@ def vote(
     if int(disputes or 0) >= 3 and observation.status == "accepted":
         observation.status = "needs_review"
     session.commit()
-    return _serialize(session, [observation])[0]
+    return _serialize_one(session, observation)
 
 
 @router.post("/reports", status_code=status.HTTP_201_CREATED)

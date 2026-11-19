@@ -170,6 +170,9 @@ class ObservationOut(BaseModel):
     status: str
     confirms: int = 0
     disputes: int = 0
+    # Repeat reports of the same price at the same store within the hour are
+    # folded into one entry; this is how many sightings that entry stands for.
+    sightings: int = 1
 
 
 class VoteIn(BaseModel):
