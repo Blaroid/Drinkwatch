@@ -333,9 +333,28 @@ class Barcode(Base):
 
 
 class PriceDaily(Base):
-    """One row per (day, chain, product): the history behind deal badges."""
+    """One row per (day, chain, product, store): the history behind deal badges.
+
+    ``store_id`` is NULL for the chain-level row (and for chains that only publish
+    a chain-wide price), so the real key is a NULLS NOT DISTINCT unique index from
+    migration 008: Postgres cannot put a nullable column in a primary key. The
+    primary_key flags below only give the ORM an identity - nothing loads
+    PriceDaily objects - and reproduce what create_all builds before migrations
+    run, which is what migration 006's backfill infers its conflict target from.
+    """
 
     __tablename__ = "price_daily"
+    __table_args__ = (
+        Index(
+            "uq_price_daily_day_chain_product_store",
+            "day",
+            "chain_id",
+            "product_id",
+            "store_id",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
 
     day: Mapped[datetime] = mapped_column(Date, primary_key=True)
     chain_id: Mapped[int] = mapped_column(
@@ -344,6 +363,7 @@ class PriceDaily(Base):
     product_id: Mapped[int] = mapped_column(
         ForeignKey("products.id", ondelete="CASCADE"), primary_key=True
     )
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"))
     price_cents: Mapped[int] = mapped_column(Integer)
     was_price_cents: Mapped[int | None] = mapped_column(Integer)
     promo_kind: Mapped[str] = mapped_column(String(16), default="none")

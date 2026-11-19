@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import time
-import zoneinfo
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -14,11 +13,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import Chain, Observation, PriceDaily, Product, ScrapeRun, Store
+from ..daily import record_daily_price
+from ..models import Chain, Observation, Product, ScrapeRun, Store
 from .normalize import per_litre_cents
 
 log = logging.getLogger(__name__)
-PerthTZ = zoneinfo.ZoneInfo("Australia/Perth")
 
 
 @dataclass
@@ -213,28 +212,18 @@ def record_price(
     )
     inserted = session.execute(stmt).scalar()
 
-    daily = (
-        pg_insert(PriceDaily)
-        .values(
-            day=observed_at.astimezone(PerthTZ).date(),
-            chain_id=chain_id,
-            product_id=product.id,
-            price_cents=price_cents,
-            was_price_cents=was_price_cents,
-            promo_kind=promo_kind,
-            source=source,
-        )
-        .on_conflict_do_update(
-            index_elements=["day", "chain_id", "product_id"],
-            set_={
-                "price_cents": pg_insert(PriceDaily).excluded.price_cents,
-                "was_price_cents": pg_insert(PriceDaily).excluded.was_price_cents,
-                "promo_kind": pg_insert(PriceDaily).excluded.promo_kind,
-                "source": pg_insert(PriceDaily).excluded.source,
-            },
-        )
+    # Daily history lives in its own module because the crowd API writes it too.
+    record_daily_price(
+        session,
+        product_id=product.id,
+        chain_id=chain_id,
+        store_id=store_id,
+        price_cents=price_cents,
+        was_price_cents=was_price_cents,
+        promo_kind=promo_kind,
+        source=source,
+        observed_at=observed_at,
     )
-    session.execute(daily)
     return inserted is not None
 
 

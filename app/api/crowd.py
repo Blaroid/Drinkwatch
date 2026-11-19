@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
+from ..daily import record_daily_price
 from ..db import get_session
 from ..models import Device, Observation, ObservationVote, Product, Store
 from ..schemas import (
@@ -219,6 +220,21 @@ def submit_observation(
     )
     session.add(observation)
     device.reputation = (device.reputation or 0) + (0 if needs_review else 1)
+    if observation.status == "accepted":
+        # A crowd price is a sighting at one shop, so it belongs in the daily
+        # ledger under that shop - otherwise today's history would only ever
+        # reflect scrapes, and crowd prices would never move a deal badge.
+        record_daily_price(
+            session,
+            product_id=product.id,
+            chain_id=store.chain_id,
+            store_id=store.id,
+            price_cents=payload.price_cents,
+            was_price_cents=payload.was_price_cents,
+            promo_kind=payload.promo_kind,
+            source="crowd",
+            observed_at=observed_at,
+        )
     session.commit()
     return _serialize(session, [observation])[0]
 
