@@ -223,6 +223,8 @@ gets the cheapest legal combination of singles, packs and multibuys:
                      "total_cents": 1910, "total": "$19.10", "complete": true,
                      "distance_km": 0.11,
                      "items": [{"requested": "monster-ultra-500ml", "units": 4,
+                                "product_slug": "monster-ultra-500ml",
+                                "label": "Monster Ultra 500ml",
                                 "cost_cents": 1380, "price": "$13.80",
                                 "breakdown": ["4 x single @ $3.45"]}]}],
          "best_single_store": {...}, "multi_store_total_cents": 1910,
@@ -230,6 +232,10 @@ gets the cheapest legal combination of singles, packs and multibuys:
          "savings_vs_worst_cents": 3988}
 
 Stores that cannot cover every item come back with `complete: false` and sort last.
+
+`product_slug` and `label` name the pack the optimiser actually bought, so they
+always agree with `cost_cents` and `breakdown`: a plan of two singles is labelled
+as the single, never as the x4 pack. `/v1/plan/route` items carry the same fields.
 
     GET /v1/value/max-caffeine?budget_cents=2000&lat=-31.9523&lon=115.8613
         &radius_km=25&mode=single_store|multi_store&include_specials=true

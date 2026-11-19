@@ -60,15 +60,28 @@ def _bundles_by_store(session, stores, families, since, distances):
                         bundles.extend(offer.bundles())
             if bundles:
                 per_store.setdefault(store.id, {})[slug] = bundles
-    return per_store, offers
+    return per_store
 
 
-def _label_for(family, offers, store_id):
-    for product in family:
-        for offer in offers.get(product.id, []):
-            if offer.store_id == store_id:
-                return product.slug, offer.label
-    return None, None
+def _line_product(breakdown: list[tuple[Bundle, int]]) -> tuple[str | None, str | None]:
+    """Slug and label of the product the chosen bundles belong to.
+
+    Each bundle carries its owning product, so the line names the pack the
+    optimiser actually bought. A plan can still mix family members (one 4-pack
+    plus a single); the product paying for most of the line is the one a client
+    shows next to the cost, and the breakdown still spells out the rest.
+    """
+    spent: dict[str, int] = {}
+    labels: dict[str, str | None] = {}
+    for bundle, count in breakdown:
+        if bundle.product_slug is None:
+            continue
+        spent[bundle.product_slug] = spent.get(bundle.product_slug, 0) + bundle.cost_cents * count
+        labels[bundle.product_slug] = bundle.product_label
+    if not spent:
+        return None, None
+    slug = max(spent, key=lambda key: spent[key])
+    return slug, labels[slug]
 
 
 def _fuel_quote(
@@ -109,7 +122,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
     stores = [store for store, _ in store_pairs]
     distances = {store.id: distance for store, distance in store_pairs}
     families = _resolve_families(session, payload.items)
-    per_store, offers = _bundles_by_store(session, stores, families, since, distances)
+    per_store = _bundles_by_store(session, stores, families, since, distances)
 
     prices = ulp_prices() if stores else {}
     store_results: list[BasketStoreOut] = []
@@ -120,7 +133,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
         lines: list[BasketLineOut] = []
         total = 0
         complete = True
-        for slug, quantity, family in families:
+        for slug, quantity, _family in families:
             bundles = available.get(slug)
             plan = cheapest_quantity_plan(bundles, quantity) if bundles else None
             if plan is None:
@@ -129,7 +142,7 @@ def basket_compare(payload: BasketCompareIn, session: Session = Depends(get_sess
                 continue
             cost, breakdown = plan
             units = sum(bundle.units * count for bundle, count in breakdown)
-            product_slug, label = _label_for(family, offers, store.id)
+            product_slug, label = _line_product(breakdown)
             lines.append(
                 BasketLineOut(
                     requested=slug,
@@ -394,10 +407,10 @@ def route_plan(
     by_id = {store.id: store for store in stores}
     distances = {store.id: distance for store, distance in store_pairs}
     families = _resolve_families(session, parsed)
-    per_store, offers = _bundles_by_store(session, stores, families, since, distances)
+    per_store = _bundles_by_store(session, stores, families, since, distances)
 
     stops: dict[int, dict] = {}
-    for slug, quantity, family in families:
+    for slug, quantity, _family in families:
         best = None
         for store in stores:
             bundles = per_store.get(store.id, {}).get(slug)
@@ -411,7 +424,7 @@ def route_plan(
             continue
         cost, store_id, breakdown = best
         entry = stops.setdefault(store_id, {"items": [], "subtotal": 0})
-        product_slug, label = _label_for(family, offers, store_id)
+        product_slug, label = _line_product(breakdown)
         entry["items"].append(
             {
                 "requested": slug,

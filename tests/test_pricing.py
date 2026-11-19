@@ -72,7 +72,17 @@ def test_offer_bundles_single_can() -> None:
     assert offer.can_caffeine_mg == pytest.approx(160.0)
     bundles = offer.bundles()
 
-    assert bundles == [Bundle(units=1, cost_cents=329, caffeine_mg=pytest.approx(160.0), label="single")]
+    assert bundles == [
+        Bundle(
+            units=1,
+            cost_cents=329,
+            caffeine_mg=pytest.approx(160.0),
+            label="single",
+            product_id=1,
+            product_slug="monster-ultra-500ml",
+            product_label="Monster Ultra 500ml",
+        )
+    ]
 
 
 def test_offer_bundles_multipack_prices_the_whole_pack() -> None:
@@ -85,6 +95,12 @@ def test_offer_bundles_multipack_prices_the_whole_pack() -> None:
     assert bundles[1].label == "4-pack"
     # 32mg/100mL x 500mL = 160mg per can, four cans to the pack.
     assert bundles[1].caffeine_mg == pytest.approx(640.0)
+    # Every option remembers the product it came from, so a plan assembled from
+    # a whole family can still name the pack it bought.
+    assert {(bundle.product_id, bundle.product_slug) for bundle in bundles} == {
+        (1, "monster-ultra-500ml")
+    }
+    assert {bundle.product_label for bundle in bundles} == {"Monster Ultra 500ml"}
 
 
 def test_offer_bundles_multibuy_promo() -> None:
