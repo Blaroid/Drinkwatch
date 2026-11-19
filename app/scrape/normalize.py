@@ -396,6 +396,11 @@ def match_product(
         source="auto",
         status="verified",
     )
+    # A scraped listing is our first chance to set the label value; a miss
+    # leaves the product on the FSANZ fallback and marked as such.
+    from ..caffeine import apply_reference_caffeine
+
+    apply_reference_caffeine(session, product)
     session.add(product)
     session.flush()
     if barcode:

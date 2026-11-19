@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..caffeine import apply_reference_caffeine
 from ..db import get_session
 from ..models import Chain, Device, Listing, Observation, Product, Report, ScrapeRun, Store
 from ..security import require_admin
@@ -334,6 +335,9 @@ def create_product(payload: ProductCreateRequest, session: Session = Depends(get
         category=payload.category,
         source="manual",
     )
+    # Manual products are still SKUs with a printed label; seed the caffeine
+    # the same way a scrape would, so "manual" is not a second unset path.
+    apply_reference_caffeine(session, product)
     session.add(product)
     session.commit()
     return {"id": product.id, "slug": product.slug}
@@ -415,6 +419,11 @@ def approve_product(
         product.pack_count = payload.pack_count
     if payload.caffeine_mg_per_100ml is not None:
         product.caffeine_mg_per_100ml = payload.caffeine_mg_per_100ml
+        product.caffeine_source = "admin"
+    elif product.caffeine_source == "default":
+        # Approval is a natural curation point: fill the label value if the
+        # scraper/crowd row never had one, without touching an admin override.
+        apply_reference_caffeine(session, product)
     product.status = "verified"
 
     if payload.merge_into_slug:

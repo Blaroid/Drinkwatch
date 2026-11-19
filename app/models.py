@@ -94,8 +94,12 @@ class Product(Base):
     )
     # same drink ignoring pack size, e.g. monster-ultra-500ml for ...-500ml-x4
     family_slug: Mapped[str | None] = mapped_column(String(160))
-    # AU formulated caffeinated beverages are capped at 32mg/100mL (FSANZ 2.6.4)
+    # AU formulated caffeinated beverages are capped at 32mg/100mL (FSANZ 2.6.4).
+    # That cap is the fallback for an unknown SKU, not a claim about this one;
+    # see caffeine_source for where the number actually came from.
     caffeine_mg_per_100ml: Mapped[float] = mapped_column(Numeric(5, 2), default=32)
+    # default | seed | openfoodfacts | admin
+    caffeine_source: Mapped[str] = mapped_column(String(16), default="default")
     # verified | pending | rejected
     status: Mapped[str] = mapped_column(String(16), default="verified")
     image_url: Mapped[str | None] = mapped_column(String(500))
@@ -108,6 +112,24 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class CaffeineReference(Base):
+    """Curated caffeine content by brand and flavour, taken from printed labels.
+
+    ``flavour`` is a normalised token key ("ultra paradise"); an empty key is the
+    brand-wide default. Kept as data rather than code so a corrected can label is
+    a row update, not a deploy, and ``source`` records where the number came
+    from. Matching ignores pack size: caffeine per 100 mL does not change with it.
+    """
+
+    __tablename__ = "caffeine_reference"
+
+    brand: Mapped[str] = mapped_column(String(60), primary_key=True)
+    flavour: Mapped[str] = mapped_column(String(80), primary_key=True, default="")
+    caffeine_mg_per_100ml: Mapped[float] = mapped_column(Numeric(5, 2))
+    source: Mapped[str] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Listing(Base):

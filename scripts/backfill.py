@@ -1,4 +1,4 @@
-"""Backfill derived product columns: normalised barcode, family slug, listings.
+"""Backfill derived product columns: normalised barcode, family slug, caffeine.
 
 Run after schema changes that add derived columns, or after a fresh scrape.
 
@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, ".")
 
+from app.caffeine import apply_reference_caffeine  # noqa: E402
 from app.db import session_scope  # noqa: E402
 from app.models import Listing, Product  # noqa: E402
 from app.scrape.normalize import (  # noqa: E402
@@ -52,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
                 product.category = wanted
                 recategorised += 1
 
+        # Existing rows would otherwise stay on the FSANZ fallback until they
+        # are touched again; this is the one-time pass that fills them.
+        caffeine_filled = sum(
+            1 for product in products if apply_reference_caffeine(session, product)
+        )
+
         indexed = 0
         for product in products:
             source_code = product.barcode or product.normalised_barcode
@@ -64,7 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"products: {len(products)} rows, {barcodes} barcodes normalised, {families} families set; "
             f"listings: {len(listings)} rows, {listing_barcodes} barcodes normalised; "
-            f"{recategorised} products recategorised, {indexed} barcode index rows written"
+            f"{recategorised} products recategorised, {indexed} barcode index rows written, "
+            f"{caffeine_filled} caffeine values seeded"
         )
         if args.dry_run:
             session.rollback()
