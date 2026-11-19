@@ -19,12 +19,20 @@ from .models import Product, Store
 
 @dataclass(frozen=True)
 class Bundle:
-    """A purchasable option: n cans for c cents."""
+    """A purchasable option: n cans for c cents, and whose product they are.
+
+    The owning product travels with the bundle because a plan is assembled from
+    a whole family (single, 4-pack, multibuy) and the responder has to name the
+    pack the optimiser actually bought, not the first family member on file.
+    """
 
     units: int
     cost_cents: int
     caffeine_mg: float
     label: str
+    product_id: int | None = None
+    product_slug: str | None = None
+    product_label: str | None = None
 
 
 @dataclass
@@ -60,10 +68,21 @@ class Offer:
         return self.can_caffeine_mg * self.pack_count
 
     def bundles(self) -> list[Bundle]:
-        options = [Bundle(1, self.price_cents, self.can_caffeine_mg, "single")]
+        owner = {
+            "product_id": self.product_id,
+            "product_slug": self.slug,
+            "product_label": self.label,
+        }
+        options = [Bundle(1, self.price_cents, self.can_caffeine_mg, "single", **owner)]
         if self.pack_count > 1:
             options.append(
-                Bundle(self.pack_count, self.price_cents, self.pack_caffeine_mg, f"{self.pack_count}-pack")
+                Bundle(
+                    self.pack_count,
+                    self.price_cents,
+                    self.pack_caffeine_mg,
+                    f"{self.pack_count}-pack",
+                    **owner,
+                )
             )
         if self.promo_kind == "multibuy" and self.promo_qty and self.promo_total_cents:
             units = self.pack_count * self.promo_qty
@@ -73,6 +92,7 @@ class Offer:
                     self.promo_total_cents,
                     self.pack_caffeine_mg * self.promo_qty,
                     f"{self.promo_qty} x {self.pack_count}-pack deal",
+                    **owner,
                 )
             )
         return options
