@@ -174,6 +174,7 @@ def record_price(
     in_stock: bool | None = None,
     listing_id: int | None = None,
     price_scope: str = "store",
+    state: str | None = None,
     observed_at: datetime | None = None,
     dedupe_key: str | None = None,
     source: str = "scrape",
@@ -182,7 +183,11 @@ def record_price(
     if price_cents <= 0:
         return False
     observed_at = observed_at or datetime.now(timezone.utc)
-    location = f"store{store_id}" if store_id is not None else f"chain{chain_id}"
+    # Chain-scope rows are keyed per state: two states can publish the same price
+    # for the same product on the same day, and dedupe would keep only the first.
+    location = (
+        f"store{store_id}" if store_id is not None else f"chain{chain_id}:{state or 'unscoped'}"
+    )
     key = dedupe_key or (
         f"{source}:{location}:{product.id}:{observed_at.date().isoformat()}:"
         f"{price_cents}:{promo_kind}:{promo_qty or 0}:{promo_total_cents or 0}"
@@ -203,6 +208,7 @@ def record_price(
             in_stock=in_stock,
             source=source,
             price_scope=price_scope,
+            state=state,
             observed_at=observed_at,
             status="accepted",
             dedupe_key=key,

@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Mapping, TypeVar
 
 from fastapi import HTTPException, status
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
 
 from ..models import Observation, Product, Store
+
+_ChainRow = TypeVar("_ChainRow")
 
 
 def utcnow() -> datetime:
@@ -78,17 +81,17 @@ _STORE_SCOPE_SQL = text(
 
 _CHAIN_SCOPE_SQL = text(
     """
-    select distinct on (o.chain_id)
+    select distinct on (o.chain_id, o.state)
            o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.state, o.observed_at
     from observations o
     where o.chain_id in :chain_ids
       and o.product_id in :product_ids
       and o.store_id is null
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.chain_id, o.observed_at desc, o.id desc
+    order by o.chain_id, o.state, o.observed_at desc, o.id desc
     """
 ).bindparams(bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True))
 
@@ -112,17 +115,17 @@ _BULK_STORE_SQL = text(
 
 _BULK_CHAIN_SQL = text(
     """
-    select distinct on (o.chain_id, o.product_id)
+    select distinct on (o.chain_id, o.product_id, o.state)
            o.id, o.store_id, o.chain_id, o.product_id, o.price_cents, o.was_price_cents,
            o.unit_price_cents_per_l, o.promo_kind, o.promo_qty, o.promo_total_cents,
-           o.in_stock, o.source, o.price_scope, o.observed_at
+           o.in_stock, o.source, o.price_scope, o.state, o.observed_at
     from observations o
     where o.chain_id in :chain_ids
       and o.product_id in :product_ids
       and o.store_id is null
       and o.status = 'accepted'
       and o.observed_at >= :since
-    order by o.chain_id, o.product_id, o.observed_at desc, o.id desc
+    order by o.chain_id, o.product_id, o.state, o.observed_at desc, o.id desc
     """
 ).bindparams(
     bindparam("chain_ids", expanding=True), bindparam("product_ids", expanding=True)
@@ -151,6 +154,41 @@ def _observation_dict(row: Observation) -> dict:
         "price_scope": row.price_scope,
         "observed_at": row.observed_at,
     }
+
+
+def chain_row_for(
+    chain_rows: Mapping[tuple, _ChainRow], *key: int, state: str | None
+) -> _ChainRow | None:
+    """The chain-scope price that applies to a store, from rows keyed ``(*key, state)``.
+
+    A row scoped to the store's own state wins. A null-state row comes from a
+    scrape that could not pin a store, and is matched to every store of the chain
+    -- the pre-state behaviour. There is deliberately no fallback from "no WA row"
+    to "another state's row": an out-of-state price must not reach a Perth store.
+    """
+    row = chain_rows.get((*key, state))
+    return row if row is not None else chain_rows.get((*key, None))
+
+
+def _freshest_of(
+    candidates: list["StorePrice | None"],
+) -> "StorePrice | None":
+    """Newest candidate wins; a tie on time goes to the cheaper price.
+
+    Used when a caller asks about a group of product rows (aliases of the same
+    can): the store's freshest sighting across the group is the honest answer,
+    rather than whichever row the database happened to return first.
+    """
+    present = [candidate for candidate in candidates if candidate is not None]
+    if not present:
+        return None
+    return min(
+        present,
+        key=lambda choice: (
+            -_as_utc(choice.primary.observed_at).timestamp(),
+            choice.primary.price_cents,
+        ),
+    )
 
 
 def bulk_latest_prices(
@@ -183,7 +221,7 @@ def bulk_latest_prices(
         ).mappings()
     }
     chain_rows = {
-        (row["chain_id"], row["product_id"]): Observation(**dict(row))
+        (row["chain_id"], row["product_id"], row.get("state")): Observation(**dict(row))
         for row in session.execute(
             _BULK_CHAIN_SQL,
             {"chain_ids": chain_ids, "product_ids": product_ids, "since": since},
@@ -194,7 +232,12 @@ def bulk_latest_prices(
         for product_id in product_ids:
             chosen = _freshest(
                 store_rows.get((store.id, product_id)),
-                chain_rows.get((store.chain_id, product_id)),
+                chain_row_for(
+                    chain_rows,
+                    store.chain_id,
+                    product_id,
+                    state=getattr(store, "state", None),
+                ),
                 store.id,
             )
             if chosen is not None:
@@ -286,10 +329,12 @@ def latest_prices(
     rows = session.execute(
         _STORE_SCOPE_SQL, {"store_ids": store_ids, "product_ids": product_ids, "since": since}
     ).mappings()
-    store_rows = {row["store_id"]: Observation(**dict(row)) for row in rows}
+    store_rows = {
+        (row["store_id"], row["product_id"]): Observation(**dict(row)) for row in rows
+    }
 
     chain_rows = {
-        row["chain_id"]: Observation(**dict(row))
+        (row["chain_id"], row["product_id"], row.get("state")): Observation(**dict(row))
         for row in session.execute(
             _CHAIN_SCOPE_SQL,
             {
@@ -302,7 +347,21 @@ def latest_prices(
 
     by_store: dict[int, StorePrice] = {}
     for store in stores:
-        chosen = _freshest(store_rows.get(store.id), chain_rows.get(store.chain_id), store.id)
+        chosen = _freshest_of(
+            [
+                _freshest(
+                    store_rows.get((store.id, product_id)),
+                    chain_row_for(
+                        chain_rows,
+                        store.chain_id,
+                        product_id,
+                        state=getattr(store, "state", None),
+                    ),
+                    store.id,
+                )
+                for product_id in product_ids
+            ]
+        )
         if chosen is not None:
             by_store[store.id] = chosen
     return by_store

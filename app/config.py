@@ -21,6 +21,11 @@ class Settings:
     scrape_enabled: bool
     scrape_user_agent: str
     scrape_browser_ua: str
+    # Woolworths only prices per state, and its search API answers from whatever
+    # store context it infers unless we name one. Set these to a WA store.
+    woolworths_store_id: str
+    woolworths_settlement: str
+    woolworths_state: str
     scheduler_enabled: bool
     cors_origins: tuple[str, ...]
     default_radius_km: float
@@ -60,6 +65,9 @@ class Settings:
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36",
             ),
+            woolworths_store_id=os.environ.get("WOOLWORTHS_STORE_ID", "").strip(),
+            woolworths_settlement=os.environ.get("WOOLWORTHS_SETTLEMENT", "").strip(),
+            woolworths_state=os.environ.get("WOOLWORTHS_STATE", "WA").strip() or "WA",
             scheduler_enabled=_flag("SCHEDULER_ENABLED", True),
             cors_origins=origins,
             default_radius_km=float(os.environ.get("DEFAULT_RADIUS_KM", "15")),
