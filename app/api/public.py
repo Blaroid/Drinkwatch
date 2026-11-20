@@ -441,10 +441,18 @@ def products(
     q: str | None = Query(default=None, max_length=80),
     brand: str | None = None,
     category: str | None = None,
+    strict: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
 ) -> list[ProductOut]:
+    """The catalogue, or the rows a query names.
+
+    ``strict`` is what the add picker asks for: every typed word must begin a
+    word in the title, with no trigram near-misses. A fuzzy hit there is how a
+    user ends up recording a price against a drink they are not holding, so the
+    picker would rather show nothing and let them correct the spelling.
+    """
     # Only verified rows: a crowd-submitted product sits at status='pending'
     # until an admin reviews it, and listing it here put unreviewed cans in the
     # app's pickers (search included, since the filters share this statement).
@@ -468,14 +476,19 @@ def products(
         )
         conditions = []
         for token in [part for part in term.split() if part]:
-            # word-boundary hit (so "v" finds V, not Violet) or a fuzzy near-miss
-            pattern = "\\m" + re.escape(token) + "\\M"
-            conditions.append(
-                or_(
-                    blob.op("~")(pattern),
-                    func.word_similarity(token, blob) > 0.40,
+            if strict:
+                # A prefix of a word ("blu" -> Blue) but never an edit distance
+                # guess, so a typo returns nothing instead of another drink.
+                conditions.append(blob.op("~")("\\m" + re.escape(token)))
+            else:
+                # word-boundary hit (so "v" finds V, not Violet) or a fuzzy near-miss
+                pattern = "\\m" + re.escape(token) + "\\M"
+                conditions.append(
+                    or_(
+                        blob.op("~")(pattern),
+                        func.word_similarity(token, blob) > 0.40,
+                    )
                 )
-            )
         stmt = stmt.where(and_(*conditions))
         order = [
             func.greatest(
@@ -705,6 +718,39 @@ def catalogue(response: Response, request: Request, session: Session = Depends(g
 @router.get("/products/{slug}", response_model=ProductOut)
 def product_detail(slug: str, session: Session = Depends(get_session)) -> ProductOut:
     return ProductOut.model_validate(get_product_by_slug(session, slug))
+
+
+@router.get(
+    "/products/{slug}/variants",
+    response_model=list[ProductOut],
+    summary="Other sizes and packs of the same flavour",
+)
+def product_variants(
+    slug: str, session: Session = Depends(get_session)
+) -> list[ProductOut]:
+    """The same drink in other sizes or carton counts.
+
+    The add flow offers these as chips so a price lands on the can in hand: a
+    user who searched "V Blue" and picked the 250mL row can say "this one is the
+    500mL" with one tap instead of leaving the picker. Only verified, active rows
+    are considered, and the brand is part of the key so unrelated "Original"
+    flavours never appear as alternatives.
+    """
+    from ..scrape.normalize import flavour_key
+
+    found = get_product_by_slug(session, slug)
+    key = flavour_key(found.brand, found.name, found.variant)
+    rows = session.scalars(
+        select(Product).where(Product.is_active.is_(True), Product.status == "verified")
+    )
+    siblings = [
+        row
+        for row in rows
+        if row.id != found.id
+        and flavour_key(row.brand, row.name, row.variant) == key
+    ]
+    siblings.sort(key=lambda row: (row.size_ml is None, row.size_ml or 0, row.pack_count))
+    return [ProductOut.model_validate(row) for row in siblings[:24]]
 
 
 @router.get("/prices", response_model=ProductPricesOut, summary="Current prices for one product near a point")
