@@ -352,6 +352,18 @@ def receipt_tokens(text: str) -> set[str]:
     return flavour_tokens(cleaned)
 
 
+def flavour_key(brand: str | None, name: str | None, variant: str | None = None) -> str:
+    """The words that name a flavour, with the size and the pack taken out.
+
+    Two rows are the same drink in another size or carton when this key matches:
+    "V Energy Drink Blue 250mL x4" and "V Blue 500mL" both key to "blue v". The
+    brand stays in the key, so two chains' unrelated "Original" rows never merge.
+    Used by the add flow to offer the sizes of the flavour the user picked.
+    """
+    text = " ".join(part for part in (brand, name, variant) if part)
+    return " ".join(sorted(receipt_tokens(text)))
+
+
 def clean_flavour(name: str, brand: str | None) -> str:
     text = name
     if brand:
